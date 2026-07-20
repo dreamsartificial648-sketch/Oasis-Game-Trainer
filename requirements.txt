@@ -1,0 +1,7 @@
+mss
+Pillow
+pynput
+opencv-python
+torch
+torchvision
+diffusers
