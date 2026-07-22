@@ -36,7 +36,10 @@ ACCENT = "#6f98ff"
 ACTION_NAMES = ["w", "a", "s", "d", "jump", "mouse_dx", "mouse_dy", "zoom"]
 ACTION_DIM = len(ACTION_NAMES)
 BINARY_ACTION_NAMES = ACTION_NAMES[:5]
-ACTION_DISPLAY_NAMES = {"w": "Up", "a": "Left", "s": "Down", "d": "Right", "jump": "Jump"}
+ACTION_DISPLAY_NAMES = {
+    "w": "Up", "a": "Left", "s": "Down", "d": "Right", "jump": "Jump",
+    "mouse_dx": "Camera Yaw", "mouse_dy": "Camera Pitch", "zoom": "Zoom",
+}
 KEY_TO_ACTION = {
     "w": "w", "up": "w",
     "a": "a", "left": "a",
@@ -63,12 +66,21 @@ def parse_frame_size(value):
             # Legacy UI values represented a square side. Map the supported values
             # to their new 16:9 equivalents instead of quietly producing a square.
             width = int(text)
-            height = round(width * 1 / 1)
-    if width * 1 != height * 1:
+            height = round(width * 9 / 16)
+    if width <= 0 or height <= 0:
+        raise ValueError("Frame width and height must be greater than zero.")
+    if width * 9 != height * 16:
         raise ValueError(f"Frame size {width}x{height} is not exactly 16:9.")
     if width % 16 or height % 16:
         raise ValueError("16:9 width and height must both be divisible by 16 (for example 256x144 or 512x288).")
     return height, width
+
+
+def set_model_frame_size(model, resolution):
+    """Retarget spatially reusable convolutional weights to a 16:9 canvas."""
+    height, width = parse_frame_size(resolution)
+    model.register_to_config(sample_size=(height, width))
+    return model
 
 
 def model_frame_size(model_or_config):
@@ -140,12 +152,19 @@ def system_telemetry(device=None):
     return result
 
 
+def action_is_idle(action):
+    return all(
+        abs(float(value)) <= (0.5 if index < 5 else 0.02)
+        for index, value in enumerate(action)
+    )
+
+
 def validation_split_indexes(pairs, validation_count, frame_gap):
     """Build a reproducible holdout containing both idle and active scenes when possible."""
     total = len(pairs)
     validation_count = min(max(1, int(validation_count)), total - 1)
     val = list(range(total - validation_count, total))
-    is_idle = lambda i: all(float(value) < 0.5 for value in pairs[i][2][:5])
+    is_idle = lambda i: action_is_idle(pairs[i][2])
     desired = []
     if any(is_idle(i) for i in range(total)) and not any(is_idle(i) for i in val):
         desired.append(max(i for i in range(total - validation_count) if is_idle(i)))
@@ -411,7 +430,22 @@ def aggregate_action_window(window_rows, method="window"):
                     binary[first] = 1.0 if vector[first] > vector[second] else 0.0
                     binary[second] = 1.0 - binary[first]
                     break
-    analog = [sum(vector[i] for vector in vectors) / len(vectors) for i in range(5, ACTION_DIM)]
+    degree_encoded = any(
+        str(row.get("camera_encoding", "")).lower() == "relative_degrees_v1"
+        or "camera_yaw_delta_degrees" in row
+        for row in window_rows
+    )
+    if degree_encoded:
+        # Relative camera rotations compose across a temporal gap. Summing preserves
+        # the total yaw/pitch that caused the target view; averaging would make a
+        # three-frame turn appear three times weaker than it really was.
+        analog = [
+            max(-1.0, min(1.0, sum(vector[i] for vector in vectors)))
+            for i in range(5, ACTION_DIM)
+        ]
+    else:
+        # Legacy pixel-normalized datasets retain their original aggregation.
+        analog = [sum(vector[i] for vector in vectors) / len(vectors) for i in range(5, ACTION_DIM)]
     return binary + analog
 
 
@@ -445,29 +479,50 @@ def observed_action_profiles(pairs):
     })
     if (0.0,) * 5 not in binary_vectors:
         binary_vectors.insert(0, (0.0,) * 5)
-    return counts, enabled, [list(vector) for vector in binary_vectors]
+    enabled_indexes = {index for index, name in enumerate(ACTION_NAMES) if name in enabled}
+    full_profiles = sorted({
+        tuple(
+            (
+                (1.0 if float(action[i]) > 0.5 else 0.0) if i < 5
+                else (0.5 if float(action[i]) > 0.02 else -0.5 if float(action[i]) < -0.02 else 0.0)
+            ) if i in enabled_indexes else 0.0
+            for i in range(ACTION_DIM)
+        )
+        for _previous, _target, action in pairs
+    })
+    return (
+        counts,
+        enabled,
+        [list(vector) for vector in binary_vectors],
+        [list(vector) for vector in full_profiles],
+    )
 
 
-def counterfactual_actions(actions, observed_binary_actions):
-    """Return a guaranteed-different, dataset-valid binary control for every row."""
+def counterfactual_actions(actions, observed_action_prototypes):
+    """Return a guaranteed-different observed control profile for every row."""
     import torch
     prototypes = torch.as_tensor(
-        observed_binary_actions, device=actions.device, dtype=actions.dtype,
+        observed_action_prototypes, device=actions.device, dtype=actions.dtype,
     )
-    if prototypes.ndim != 2 or prototypes.shape[1] != 5:
-        raise ValueError("Observed binary action profiles must have five values each.")
+    if prototypes.ndim != 2 or prototypes.shape[1] != ACTION_DIM:
+        raise ValueError(f"Observed action profiles must have {ACTION_DIM} values each.")
     if prototypes.shape[0] < 2:
         raise ValueError("Counterfactual training needs at least two distinct observed action profiles.")
-    current = (actions[:, :5] > 0.5).to(dtype=actions.dtype)
+    current = torch.cat([
+        (actions[:, :5] > 0.5).to(dtype=actions.dtype),
+        torch.where(
+            actions[:, 5:] > 0.02,
+            torch.full_like(actions[:, 5:], 0.5),
+            torch.where(actions[:, 5:] < -0.02, torch.full_like(actions[:, 5:], -0.5), torch.zeros_like(actions[:, 5:])),
+        ),
+    ], dim=1)
     different = torch.any(prototypes[None, :, :] != current[:, None, :], dim=2)
     choices = []
     for row in range(actions.shape[0]):
         candidates = torch.nonzero(different[row], as_tuple=False).flatten()
         selected = candidates[torch.randint(candidates.numel(), (1,), device=actions.device)]
         choices.append(prototypes[selected].squeeze(0))
-    wrong = torch.zeros_like(actions)
-    wrong[:, :5] = torch.stack(choices, dim=0)
-    return wrong
+    return torch.stack(choices, dim=0)
 
 
 def inspect_action_dataset(dataset_dir, frame_gap=1, action_aggregation="window"):
@@ -500,6 +555,19 @@ def inspect_action_dataset(dataset_dir, frame_gap=1, action_aggregation="window"
         "recommended_frame_gap": recommended_frame_gap(capture_fps),
         "enabled_action_names": [],
         "observed_binary_actions": [],
+        "observed_action_prototypes": [],
+        "camera_encoding": dataset_info.get("camera_encoding", "legacy_pixels"),
+        "camera_input_source": dataset_info.get("camera_input_source", "unknown"),
+        "camera_degree_rows": 0,
+        "camera_active_rows": 0,
+        "right_mouse_rows": 0,
+        "absolute_yaw_degrees": 0.0,
+        "absolute_pitch_degrees": 0.0,
+        "yaw_counts_per_360_degrees": dataset_info.get("yaw_counts_per_360_degrees"),
+        "pitch_counts_per_180_degrees": dataset_info.get("pitch_counts_per_180_degrees"),
+        "max_yaw_degrees_per_frame": dataset_info.get("max_yaw_degrees_per_frame", 45.0),
+        "max_pitch_degrees_per_frame": dataset_info.get("max_pitch_degrees_per_frame", 30.0),
+        "require_right_mouse_for_camera": bool(dataset_info.get("require_right_mouse_for_camera", False)),
     }
     last_legacy_index = None
     last_legacy_timestamp = None
@@ -534,6 +602,12 @@ def inspect_action_dataset(dataset_dir, frame_gap=1, action_aggregation="window"
         row["_line_number"] = line_number
         path = frames_dir / str(row.get("filename", ""))
         if path.is_file():
+            if str(row.get("camera_encoding", "")).lower() == "relative_degrees_v1":
+                report["camera_degree_rows"] += 1
+            report["camera_active_rows"] += int(bool(row.get("camera_active", False)))
+            report["right_mouse_rows"] += int(bool(row.get("right_mouse", False)))
+            report["absolute_yaw_degrees"] += abs(float(row.get("camera_yaw_delta_degrees", 0.0)))
+            report["absolute_pitch_degrees"] += abs(float(row.get("camera_pitch_delta_degrees", 0.0)))
             row["path"] = path
             rows.append(row)
             report["valid_rows"] += 1
@@ -583,10 +657,13 @@ def inspect_action_dataset(dataset_dir, frame_gap=1, action_aggregation="window"
             action = aggregate_action_window(window_rows, action_aggregation)
             pairs.append((previous["path"], target["path"], action))
     report["valid_transitions"] = len(pairs)
-    pair_counts, enabled_actions, binary_profiles = observed_action_profiles(pairs)
+    pair_counts, enabled_actions, binary_profiles, action_prototypes = observed_action_profiles(pairs)
     report["transition_action_counts"] = pair_counts
     report["enabled_action_names"] = enabled_actions
     report["observed_binary_actions"] = binary_profiles
+    report["observed_action_prototypes"] = action_prototypes
+    if report["camera_degree_rows"] and capture_fps:
+        report["recommended_frame_gap"] = recommended_frame_gap(capture_fps, target_seconds=0.12)
     return report, pairs
 
 
@@ -684,12 +761,12 @@ def save_action_model(model, output_dir, args, epoch, stopped=False):
     model.save_pretrained(output_dir / "unet", safe_serialization=True)
     info = {
         "model_type": "action_conditioned_rectified_flow_video",
-        "format_version": 2,
+        "format_version": 3,
         "name": args.model_name,
         "resolution": f"{model_frame_size(model)[1]}x{model_frame_size(model)[0]}",
         "width": model_frame_size(model)[1],
         "height": model_frame_size(model)[0],
-        "aspect_ratio": "1:1",
+        "aspect_ratio": "16:9",
         "in_channels": int(model.config.in_channels),
         "action_names": ACTION_NAMES,
         "action_encoding": "broadcast_spatial_channels_with_neutral_dropout",
@@ -697,8 +774,16 @@ def save_action_model(model, output_dir, args, epoch, stopped=False):
         "enabled_action_names": list(getattr(args, "enabled_action_names", ACTION_NAMES)),
         "action_counts": dict(getattr(args, "dataset_action_counts", {})),
         "observed_binary_actions": list(getattr(args, "observed_binary_actions", [])),
+        "observed_action_prototypes": list(getattr(args, "observed_action_prototypes", [])),
         "capture_fps": getattr(args, "capture_fps", None),
         "recommended_frame_gap": getattr(args, "recommended_frame_gap", None),
+        "camera_encoding": str(getattr(args, "camera_encoding", "legacy_pixels")),
+        "camera_input_source": str(getattr(args, "camera_input_source", "unknown")),
+        "yaw_counts_per_360_degrees": getattr(args, "yaw_counts_per_360_degrees", None),
+        "pitch_counts_per_180_degrees": getattr(args, "pitch_counts_per_180_degrees", None),
+        "max_yaw_degrees_per_frame": float(getattr(args, "max_yaw_degrees_per_frame", 45.0)),
+        "max_pitch_degrees_per_frame": float(getattr(args, "max_pitch_degrees_per_frame", 30.0)),
+        "require_right_mouse_for_camera": bool(getattr(args, "require_right_mouse_for_camera", False)),
         "action_input_scale": float(getattr(args, "action_input_scale", 1.0)),
         "neutral_action_dropout": float(getattr(args, "neutral_action_dropout", 0.0)),
         "motion_loss_weight": float(getattr(args, "motion_loss_weight", 0.0)),
@@ -853,8 +938,8 @@ def evaluate_action_model(model, val_loader, device, amp_enabled, args):
             with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=amp_enabled):
                 target_velocity = (clean - noise).float()
                 pred = model(torch.cat([x_t, previous, maps], dim=1), timesteps).sample.float()
-                if len(args.observed_binary_actions) >= 2:
-                    wrong_actions = counterfactual_actions(actions, args.observed_binary_actions)
+                if len(args.observed_action_prototypes) >= 2:
+                    wrong_actions = counterfactual_actions(actions, args.observed_action_prototypes)
                     wrong_maps = action_maps(
                         wrong_actions, clean.shape[-2], clean.shape[-1],
                         dtype=clean.dtype, scale=args.action_input_scale,
@@ -864,12 +949,15 @@ def evaluate_action_model(model, val_loader, device, amp_enabled, args):
                     ).sample.float()
             reconstructed = x_t.float() + (1.0 - t) * pred
             per_sample = torch.mean((pred - target_velocity) ** 2, dim=(1, 2, 3))
-            if len(args.observed_binary_actions) >= 2:
+            if len(args.observed_action_prototypes) >= 2:
                 wrong_error = torch.mean((wrong_pred - target_velocity) ** 2, dim=(1, 2, 3))
                 totals["counterfactual_correct"] += float((per_sample < wrong_error).sum().item())
                 totals["counterfactual_advantage"] += float((wrong_error - per_sample).sum().item())
                 counts["counterfactual"] += int(clean.shape[0])
-            idle_mask = torch.all(actions[:, :5] < 0.5, dim=1)
+            idle_mask = (
+                torch.all(actions[:, :5] < 0.5, dim=1)
+                & torch.all(torch.abs(actions[:, 5:]) <= 0.02, dim=1)
+            )
             action_mask = ~idle_mask
             totals["flow"] += float(per_sample.sum().item())
             totals["temporal"] += float(F.l1_loss(reconstructed, clean.float(), reduction="sum").item())
@@ -909,14 +997,20 @@ def evaluate_action_model(model, val_loader, device, amp_enabled, args):
 
     # Compare velocity predictions for canonical controls using the exact same
     # previous frame, noise, and timestep. This isolates conditioning response.
-    enabled_indexes = [
-        index for index, name in enumerate(BINARY_ACTION_NAMES)
+    canonical_specs = [
+        (name, index, 1.0) for index, name in enumerate(BINARY_ACTION_NAMES)
         if name in args.enabled_action_names
     ]
-    canonical = torch.zeros((1 + len(enabled_indexes), ACTION_DIM), device=device,
+    if "mouse_dx" in args.enabled_action_names:
+        canonical_specs.extend([("yaw_left", 5, -0.5), ("yaw_right", 5, 0.5)])
+    if "mouse_dy" in args.enabled_action_names:
+        canonical_specs.extend([("pitch_down", 6, -0.5), ("pitch_up", 6, 0.5)])
+    if "zoom" in args.enabled_action_names:
+        canonical_specs.extend([("zoom_out", 7, -0.5), ("zoom_in", 7, 0.5)])
+    canonical = torch.zeros((1 + len(canonical_specs), ACTION_DIM), device=device,
                             dtype=diagnostic_previous.dtype)
-    for row, index in enumerate(enabled_indexes, 1):
-        canonical[row, index] = 1.0
+    for row, (_label, index, value) in enumerate(canonical_specs, 1):
+        canonical[row, index] = value
     sample_count = canonical.shape[0]
     previous_many = diagnostic_previous.expand(sample_count, -1, -1, -1)
     x_t_many = diagnostic_x_t.expand(sample_count, -1, -1, -1)
@@ -930,8 +1024,8 @@ def evaluate_action_model(model, val_loader, device, amp_enabled, args):
                             t_many.flatten() * 1000.0).sample.float()
     differences = torch.mean(torch.abs(predictions[1:] - predictions[:1]), dim=(1, 2, 3))
     sensitivity = {
-        BINARY_ACTION_NAMES[action_index]: float(differences[row].item())
-        for row, action_index in enumerate(enabled_indexes)
+        label: float(differences[row].item())
+        for row, (label, _action_index, _value) in enumerate(canonical_specs)
     }
     sensitivity["mean"] = float(differences.mean().item()) if differences.numel() else 0.0
     return validation, sensitivity
@@ -967,8 +1061,8 @@ def training_worker(args):
     )
     if len(pairs) < 2:
         raise ValueError("The selected training chunk contains fewer than two transitions.")
-    action_counts, enabled_action_names, observed_binary_actions = observed_action_profiles(pairs)
-    if len(observed_binary_actions) < 2:
+    action_counts, enabled_action_names, observed_binary_actions, observed_action_prototypes = observed_action_profiles(pairs)
+    if len(observed_action_prototypes) < 2:
         raise ValueError(
             "This dataset has fewer than two distinct observed control profiles. "
             "Record idle plus at least one active control before action training."
@@ -976,8 +1070,16 @@ def training_worker(args):
     args.dataset_action_counts = action_counts
     args.enabled_action_names = enabled_action_names
     args.observed_binary_actions = observed_binary_actions
+    args.observed_action_prototypes = observed_action_prototypes
     args.capture_fps = dataset_report.get("capture_fps")
     args.recommended_frame_gap = dataset_report.get("recommended_frame_gap")
+    args.camera_encoding = dataset_report.get("camera_encoding", "legacy_pixels")
+    args.camera_input_source = dataset_report.get("camera_input_source", "unknown")
+    args.yaw_counts_per_360_degrees = dataset_report.get("yaw_counts_per_360_degrees")
+    args.pitch_counts_per_180_degrees = dataset_report.get("pitch_counts_per_180_degrees")
+    args.max_yaw_degrees_per_frame = dataset_report.get("max_yaw_degrees_per_frame", 45.0)
+    args.max_pitch_degrees_per_frame = dataset_report.get("max_pitch_degrees_per_frame", 30.0)
+    args.require_right_mouse_for_camera = dataset_report.get("require_right_mouse_for_camera", False)
     dataset = ActionPairDataset(pairs, args.resolution, args.condition_noise)
 
     validation_count = max(1, int(len(dataset) * args.validation_split)) if len(dataset) >= 10 else 1
@@ -998,17 +1100,24 @@ def training_worker(args):
         loader_kwargs["prefetch_factor"] = 2
     sampler = None
     if args.balance_actions:
-        # Oversample transitions containing less common binary controls without
+        # Oversample transitions containing less common controls (including signed
+        # camera/zoom movement) without
         # rewriting files or metadata. A cap avoids turning a handful of rare clips
         # into almost every batch.
         selected_actions = [pairs[index][2] for index in train_dataset.indices]
-        counts = [sum(float(action[i]) > 0.5 for action in selected_actions) for i in range(5)]
+        counts = [
+            sum(abs(float(action[i])) > (0.5 if i < 5 else 0.02) for action in selected_actions)
+            for i in range(ACTION_DIM)
+        ]
         reference = max(1, max(counts))
         weights = []
         for action in selected_actions:
-            active = [i for i, value in enumerate(action[:5]) if float(value) > 0.5]
+            active = [
+                i for i, value in enumerate(action)
+                if abs(float(value)) > (0.5 if i < 5 else 0.02)
+            ]
             if active:
-                weight = max(min(8.0, reference / max(1, counts[i])) for i in active)
+                weight = max(min(8.0, math.sqrt(reference / max(1, counts[i]))) for i in active)
             else:
                 weight = 1.0
             weights.append(weight)
@@ -1036,10 +1145,14 @@ def training_worker(args):
         if model_frame_size(model) != parse_frame_size(args.resolution):
             actual_h, actual_w = model_frame_size(model)
             requested_h, requested_w = parse_frame_size(args.resolution)
-            raise ValueError(
-                f"The continuation model is {actual_w}x{actual_h}, but training is set to "
-                f"{requested_w}x{requested_h}. Select the checkpoint's exact size."
+            event(
+                type="warning",
+                message=(
+                    f"Retargeting continuation model canvas from {actual_w}x{actual_h} to "
+                    f"{requested_w}x{requested_h}. The learned convolutional weights are preserved."
+                ),
             )
+            set_model_frame_size(model, args.resolution)
         initialization = "continued action model"
     elif args.base_model:
         if not base_video_model_is_valid(args.base_model):
@@ -1048,10 +1161,14 @@ def training_worker(args):
         if model_frame_size(model) != parse_frame_size(args.resolution):
             actual_h, actual_w = model_frame_size(model)
             requested_h, requested_w = parse_frame_size(args.resolution)
-            raise ValueError(
-                f"The base model is {actual_w}x{actual_h}, but training is set to "
-                f"{requested_w}x{requested_h}. A square base checkpoint cannot initialize a true 16:9 run."
+            event(
+                type="warning",
+                message=(
+                    f"Retargeting base model canvas from {actual_w}x{actual_h} to "
+                    f"{requested_w}x{requested_h}. The learned convolutional weights are preserved."
+                ),
             )
+            set_model_frame_size(model, args.resolution)
         model = expand_unet_for_actions(model)
         initialization = "pretrained Roblox Flow video model"
     else:
@@ -1121,10 +1238,12 @@ def training_worker(args):
         "action_sensitivity": None,
         "dataset": {"transitions": len(pairs), "training": train_count,
                     "validation": validation_count,
-                    "validation_idle": sum(all(float(v) < 0.5 for v in pairs[i][2][:5]) for i in val_indexes),
-                    "validation_action": sum(not all(float(v) < 0.5 for v in pairs[i][2][:5]) for i in val_indexes),
+                    "validation_idle": sum(action_is_idle(pairs[i][2]) for i in val_indexes),
+                    "validation_action": sum(not action_is_idle(pairs[i][2]) for i in val_indexes),
                     "capture_fps": args.capture_fps,
                     "recommended_frame_gap": args.recommended_frame_gap,
+                    "camera_encoding": args.camera_encoding,
+                    "camera_input_source": args.camera_input_source,
                     "enabled_action_names": enabled_action_names,
                     "action_counts": action_counts},
         "settings": {
@@ -1152,6 +1271,9 @@ def training_worker(args):
         action_counts=action_counts,
         enabled_action_names=enabled_action_names,
         observed_binary_actions=observed_binary_actions,
+        observed_action_prototypes=observed_action_prototypes,
+        camera_encoding=args.camera_encoding,
+        camera_input_source=args.camera_input_source,
         capture_fps=args.capture_fps,
         recommended_frame_gap=args.recommended_frame_gap,
         frame_gap=args.frame_gap,
@@ -1227,7 +1349,7 @@ def training_worker(args):
                 contrast_loss = pred.float().new_tensor(0.0)
                 contrast_active = (
                     args.action_contrast_weight > 0
-                    and len(args.observed_binary_actions) > 1
+                    and len(args.observed_action_prototypes) > 1
                     and (batch_index - 1) % max(1, args.contrast_every) == 0
                 )
                 if contrast_active:
@@ -1237,7 +1359,7 @@ def training_worker(args):
                     contrast_count = min(max(1, int(args.contrast_samples)), actions.shape[0])
                     contrast_indexes = torch.randperm(actions.shape[0], device=actions.device)[:contrast_count]
                     true_actions = actions[contrast_indexes]
-                    wrong_actions = counterfactual_actions(true_actions, args.observed_binary_actions)
+                    wrong_actions = counterfactual_actions(true_actions, args.observed_action_prototypes)
                     true_maps = action_maps(true_actions, clean.shape[-2], clean.shape[-1],
                                             dtype=clean.dtype, scale=args.action_input_scale)
                     wrong_maps = action_maps(wrong_actions, clean.shape[-2], clean.shape[-1],
@@ -1630,7 +1752,9 @@ class TrainTab(ttk.Frame):
         grid = ttk.Frame(card, style="Card.TFrame")
         grid.pack(fill="x")
         self.epochs = Field(grid, "Epochs", "30")
-        self.resolution = Field(grid, "Training frame size (1:1)", "256x256", ["256x256", "512x288"])
+        self.resolution = Field(
+            grid, "Training frame size (16:9)", "256x144", ["256x144", "512x288"]
+        )
         self.batch = Field(grid, "Batch size", "2", ["1", "2", "4", "5"])
         self.lr = Field(grid, "Learning rate", "0.00002", ["0.00001", "0.00002", "0.00005", "0.0001"])
         self.workers = Field(grid, "Data workers", "4", ["0", "2", "4", "6", "8", "12"])
@@ -1690,7 +1814,7 @@ class TrainTab(ttk.Frame):
         ttk.Checkbutton(card, text="Gradient checkpointing", variable=self.ckpt_var).pack(anchor="w")
         ttk.Checkbutton(
             card,
-            text="Balance W/A/S/D/Jump sampling (does not alter dataset files)",
+            text="Balance movement, camera, and zoom sampling (does not alter dataset files)",
             variable=self.balance_actions_var,
         ).pack(anchor="w", pady=(2, 0))
 
@@ -1945,6 +2069,12 @@ class TrainTab(ttk.Frame):
                     continue
                 if rate < 5.0:
                     warnings.append(f"{name.upper()} is rare ({rate:.1f}% of frames); test it carefully or record more clean examples")
+            camera_rate = 100.0 * report["camera_active_rows"] / usable
+            right_mouse_rate = 100.0 * report["right_mouse_rows"] / usable
+            if report["right_mouse_rows"] and not report["camera_active_rows"]:
+                problems.append("right mouse was recorded, but no camera yaw/pitch labels were captured")
+            elif report["camera_degree_rows"] and 0.0 < camera_rate < 5.0:
+                warnings.append(f"Degree-labelled camera movement is rare ({camera_rate:.1f}% of frames)")
             if idle_pct > 30.0:
                 warnings.append(f"Idle input is common ({idle_pct:.1f}% of frames)")
             quality = "READY" if not problems else "NEEDS CLEANUP"
@@ -1961,6 +2091,9 @@ class TrainTab(ttk.Frame):
                 f"(current: {int(self.frame_gap.get())})\n"
                 f"Idle: {idle_pct:.1f}%\n"
                 f"Enabled controls: {', '.join(ACTION_DISPLAY_NAMES.get(name, name) for name in report['enabled_action_names']) or 'none'}\n"
+                f"Camera encoding: {report['camera_encoding']} ({report['camera_input_source']})\n"
+                f"Camera-labelled frames: {camera_rate:.1f}% | right mouse: {right_mouse_rate:.1f}%\n"
+                f"Recorded rotation: yaw {report['absolute_yaw_degrees']:.1f}° | pitch {report['absolute_pitch_degrees']:.1f}°\n"
                 + "Action coverage: "
                 + ", ".join(f"{name.upper()} {rate:.1f}%" for name, rate in binary_rates.items())
                 + "\n\n"
@@ -2025,7 +2158,7 @@ class TrainTab(ttk.Frame):
             if recommended_gap and recommended_gap != frame_gap:
                 self.append(
                     f"FRAME-GAP NOTE: this {report.get('capture_fps')} FPS capture recommends gap "
-                    f"{recommended_gap} (~0.25 seconds); current gap is {frame_gap}."
+                    f"{recommended_gap}; current gap is {frame_gap}. Camera degree datasets use a shorter horizon."
                 )
             if report["missing_images"] or report["duplicate_indices"] or report["invalid_json"]:
                 proceed = messagebox.askyesno(
@@ -2073,6 +2206,8 @@ class TrainTab(ttk.Frame):
                 "preview_steps": int(self.preview_steps.get()),
                 "balance_actions": bool(self.balance_actions_var.get()),
             }
+            # Validate here so mistakes are reported in the UI before a worker starts.
+            parse_frame_size(values["resolution"])
             output = Path(self.output_var.get())
             output.mkdir(parents=True, exist_ok=True)
             (output / STOP_FILE_NAME).unlink(missing_ok=True)
@@ -2191,6 +2326,10 @@ class TrainTab(ttk.Frame):
                     "enabled (rare controls are oversampled)" if info.get("balance_actions")
                     else "disabled"
                 )
+            )
+            self.append(
+                f"Camera labels: {info.get('camera_encoding', 'legacy_pixels')}  |  "
+                f"source: {info.get('camera_input_source', 'unknown')}"
             )
             self.append("Action counts: " + ", ".join(f"{k.upper()}={v}" for k, v in info.get("action_counts", {}).items()))
         elif kind == "progress":
@@ -2322,6 +2461,7 @@ class PlayerTab(ttk.Frame):
         self.pending_mouse_dx = 0.0
         self.pending_mouse_dy = 0.0
         self.pending_zoom = 0.0
+        self.right_mouse_held = False
         self.control_lock = threading.Lock()
         self.frame_index = 0
         self.noise_state = None
@@ -2379,6 +2519,12 @@ class PlayerTab(ttk.Frame):
         self.guidance.pack(fill="x", pady=5)
         self.active_noise = Field(controls, "Active motion noise multiplier", str(DEFAULT_ACTIVE_NOISE_MULTIPLIER), ["0.25", "0.5", "0.75", "1.0"])
         self.active_noise.pack(fill="x", pady=5)
+        self.require_right_mouse_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            controls,
+            text="Camera input requires right-mouse drag",
+            variable=self.require_right_mouse_var,
+        ).pack(anchor="w", pady=(3, 3))
         ttk.Button(controls, text="Calibrate Movement from Video", command=self.calibrate_motion_from_video).pack(fill="x", pady=(7, 2))
         self.motion_profile_var = tk.StringVar(value=self.motion_profile_summary)
         ttk.Label(controls, textvariable=self.motion_profile_var, style="Meta.TLabel", wraplength=250).pack(anchor="w", pady=(0, 6))
@@ -2393,8 +2539,8 @@ class PlayerTab(ttk.Frame):
             controls,
             text=(
                 "Use W/A/S/D or the arrow keys, plus Space. Idle holds the current frame; an active control shows the "
-                "model's raw, action-guided next frame. Mouse and wheel use the recorder's fixed "
-                "normalization. A reference video can calibrate movement frequency, but not teach missing controls. "
+                "model's raw, action-guided next frame. Right-drag controls degree-calibrated yaw/pitch; the wheel "
+                "controls zoom. A reference video can calibrate movement frequency, but not teach missing controls. "
                 "No display smoothing, anchors, or RGB blending are applied."
             ),
             style="Meta.TLabel",
@@ -2624,7 +2770,12 @@ class PlayerTab(ttk.Frame):
             with self.control_lock:
                 self.pending_zoom += float(dy)
 
-        self.mouse_listener = mouse.Listener(on_move=on_move, on_scroll=on_scroll)
+        def on_click(_x, _y, button, pressed):
+            if button == mouse.Button.right:
+                with self.control_lock:
+                    self.right_mouse_held = bool(pressed)
+
+        self.mouse_listener = mouse.Listener(on_move=on_move, on_scroll=on_scroll, on_click=on_click)
         self.mouse_listener.daemon = True
         self.mouse_listener.start()
 
@@ -2673,10 +2824,11 @@ class PlayerTab(ttk.Frame):
     def snapshot_runtime_settings(self):
         """Publish the two UI choices plus checkpoint-owned action scaling."""
         model_key = self.model_var.get()
+        info = self.selected_model_info(model_key)
         if self.runtime_settings.get("model_key") == model_key:
             action_scale = float(self.runtime_settings.get("action_input_scale", 1.0))
         else:
-            action_scale = float(self.selected_model_info(model_key).get("action_input_scale", 1.0))
+            action_scale = float(info.get("action_input_scale", 1.0))
         return {
             "model_key": model_key,
             "seed": self.player_seed,
@@ -2686,6 +2838,12 @@ class PlayerTab(ttk.Frame):
             "motion_noise_refresh": self.motion_noise_refresh,
             "active_noise_multiplier": max(0.0, min(1.0, float(self.active_noise.get()))),
             "guidance": max(0.0, float(self.guidance.get())),
+            "camera_encoding": str(info.get("camera_encoding", "legacy_pixels")),
+            "yaw_counts_per_360_degrees": float(info.get("yaw_counts_per_360_degrees") or 2400.0),
+            "pitch_counts_per_180_degrees": float(info.get("pitch_counts_per_180_degrees") or 1200.0),
+            "max_yaw_degrees_per_frame": float(info.get("max_yaw_degrees_per_frame", 45.0)),
+            "max_pitch_degrees_per_frame": float(info.get("max_pitch_degrees_per_frame", 30.0)),
+            "require_right_mouse": bool(self.require_right_mouse_var.get()),
         }
 
     def publish_runtime_settings(self):
@@ -2694,8 +2852,19 @@ class PlayerTab(ttk.Frame):
 
     def action_snapshot(self, settings, reset_mouse=True):
         with self.control_lock:
-            mouse_dx = max(-1.0, min(1.0, self.pending_mouse_dx / PLAYER_MOUSE_SCALE))
-            mouse_dy = max(-1.0, min(1.0, self.pending_mouse_dy / PLAYER_MOUSE_SCALE))
+            camera_allowed = not settings.get("require_right_mouse", True) or self.right_mouse_held
+            if str(settings.get("camera_encoding", "legacy_pixels")).lower() == "relative_degrees_v1":
+                yaw_counts = max(1.0, float(settings.get("yaw_counts_per_360_degrees", 2400.0)))
+                pitch_counts = max(1.0, float(settings.get("pitch_counts_per_180_degrees", 1200.0)))
+                max_yaw = max(1.0, float(settings.get("max_yaw_degrees_per_frame", 45.0)))
+                max_pitch = max(1.0, float(settings.get("max_pitch_degrees_per_frame", 30.0)))
+                yaw_degrees = self.pending_mouse_dx * (360.0 / yaw_counts) if camera_allowed else 0.0
+                pitch_degrees = -self.pending_mouse_dy * (180.0 / pitch_counts) if camera_allowed else 0.0
+                mouse_dx = max(-1.0, min(1.0, yaw_degrees / max_yaw))
+                mouse_dy = max(-1.0, min(1.0, pitch_degrees / max_pitch))
+            else:
+                mouse_dx = max(-1.0, min(1.0, self.pending_mouse_dx / PLAYER_MOUSE_SCALE)) if camera_allowed else 0.0
+                mouse_dy = max(-1.0, min(1.0, self.pending_mouse_dy / PLAYER_MOUSE_SCALE)) if camera_allowed else 0.0
             zoom = max(-1.0, min(1.0, self.pending_zoom / PLAYER_ZOOM_SCALE))
             if reset_mouse:
                 self.pending_mouse_dx = 0.0
@@ -2905,6 +3074,16 @@ class PlayerTab(ttk.Frame):
                     values = [0.0] * ACTION_DIM
                     values[index] = 1.0
                     compare_actions.append((ACTION_DISPLAY_NAMES.get(name, name.upper()), values))
+            for label, index, value, control_name in (
+                ("Yaw Left", 5, -0.5, "mouse_dx"),
+                ("Yaw Right", 5, 0.5, "mouse_dx"),
+                ("Pitch Up", 6, 0.5, "mouse_dy"),
+                ("Pitch Down", 6, -0.5, "mouse_dy"),
+            ):
+                if control_name in enabled:
+                    values = [0.0] * ACTION_DIM
+                    values[index] = value
+                    compare_actions.append((label, values))
             for profile in info.get("observed_binary_actions", []):
                 active = [BINARY_ACTION_NAMES[i] for i, value in enumerate(profile[:5]) if float(value) > 0.5]
                 if len(active) < 2 or any(name not in enabled for name in active):
