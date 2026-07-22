@@ -525,7 +525,7 @@ def counterfactual_actions(actions, observed_action_prototypes):
     return torch.stack(choices, dim=0)
 
 
-def inspect_action_dataset(dataset_dir, frame_gap=1, action_aggregation="window"):
+def _inspect_action_dataset(dataset_dir, frame_gap=1, action_aggregation="window"):
     """Profile recorder data without changing it, so bad captures are visible before training."""
     dataset_dir = Path(dataset_dir)
     frame_gap = max(1, int(frame_gap))
@@ -665,6 +665,69 @@ def inspect_action_dataset(dataset_dir, frame_gap=1, action_aggregation="window"
     if report["camera_degree_rows"] and capture_fps:
         report["recommended_frame_gap"] = recommended_frame_gap(capture_fps, target_seconds=0.12)
     return report, pairs
+
+
+def dataset_directories(value):
+    """Parse one or more dataset folders without requiring users to merge recordings."""
+    if isinstance(value, (list, tuple)):
+        entries = value
+    else:
+        entries = str(value or "").split(";")
+    directories = []
+    for entry in entries:
+        text = str(entry).strip()
+        if not text:
+            continue
+        path = Path(text).expanduser()
+        if path not in directories:
+            directories.append(path)
+    return directories
+
+
+def inspect_action_dataset(dataset_dir, frame_gap=1, action_aggregation="window"):
+    """Inspect one or more independent recorder folders as one training set.
+
+    Every folder remains separate on disk; only its valid transitions are combined.
+    This makes replay training possible without colliding frame indexes or sessions.
+    """
+    directories = dataset_directories(dataset_dir)
+    if not directories:
+        raise ValueError("Select at least one recorded action dataset folder.")
+    reports = []
+    pairs = []
+    for directory in directories:
+        if not directory.is_dir():
+            raise ValueError(f"Dataset folder does not exist: {directory}")
+        report, folder_pairs = _inspect_action_dataset(directory, frame_gap, action_aggregation)
+        reports.append(report)
+        pairs.extend(folder_pairs)
+    if len(reports) == 1:
+        return reports[0], pairs
+
+    combined = dict(reports[0])
+    for key in (
+        "metadata_rows", "valid_rows", "missing_images", "invalid_json",
+        "duplicate_indices", "sessions", "legacy_segments", "idle_rows",
+        "camera_degree_rows", "camera_active_rows", "right_mouse_rows",
+    ):
+        combined[key] = sum(int(report.get(key, 0)) for report in reports)
+    for key in ("estimated_minutes", "absolute_yaw_degrees", "absolute_pitch_degrees"):
+        combined[key] = sum(float(report.get(key, 0.0)) for report in reports)
+    combined["dataset_folders"] = [str(directory) for directory in directories]
+    combined["dataset_count"] = len(directories)
+    combined["capture_fps"] = reports[0].get("capture_fps") if all(
+        report.get("capture_fps") == reports[0].get("capture_fps") for report in reports
+    ) else None
+    combined["recommended_frame_gap"] = recommended_frame_gap(combined["capture_fps"])
+    action_counts, enabled, binary_profiles, prototypes = observed_action_profiles(pairs)
+    combined.update({
+        "valid_transitions": len(pairs),
+        "transition_action_counts": action_counts,
+        "enabled_action_names": enabled,
+        "observed_binary_actions": binary_profiles,
+        "observed_action_prototypes": prototypes,
+    })
+    return combined, pairs
 
 
 def read_action_dataset(dataset_dir, frame_gap=1, action_aggregation="window"):
@@ -1718,7 +1781,7 @@ class TrainTab(ttk.Frame):
         self.output_var = tk.StringVar(value=str(ACTION_MODELS_DIR / "Roblox Action Flow"))
 
         rows = [
-            ("Recorded action dataset", self.dataset_var, self.browse_dataset),
+            ("Recorded action dataset(s)", self.dataset_var, self.browse_dataset),
             ("Roblox Flow video model (optional)", self.base_model_var, self.browse_base_model),
             ("Continue action model (optional)", self.continue_var, self.browse_continue),
             ("Save action model to", self.output_var, self.browse_output),
@@ -1729,6 +1792,13 @@ class TrainTab(ttk.Frame):
             line.pack(fill="x", pady=(3, 0))
             ttk.Entry(line, textvariable=variable, style="Field.TEntry").pack(side="left", fill="x", expand=True)
             ttk.Button(line, text="Browse...", command=command).pack(side="left", padx=(7, 0))
+
+        ttk.Label(
+            card,
+            text="Use Browse to choose the first recording, then Add Dataset to include older recordings. Folders are combined for training only; no files are moved or changed.",
+            style="Meta.TLabel", wraplength=900, justify="left",
+        ).pack(anchor="w", pady=(5, 0))
+        ttk.Button(card, text="Add Dataset", command=self.add_dataset).pack(anchor="w", pady=(3, 4))
 
         ttk.Label(
             card,
@@ -2044,11 +2114,22 @@ class TrainTab(ttk.Frame):
         if value:
             self.dataset_var.set(value)
 
+    def add_dataset(self):
+        value = filedialog.askdirectory(title="Add another recorder dataset folder")
+        if not value:
+            return
+        selected = dataset_directories(self.dataset_var.get())
+        folder = Path(value)
+        if folder not in selected:
+            selected.append(folder)
+        self.dataset_var.set("; ".join(str(path) for path in selected))
+
     def check_dataset(self):
         try:
-            dataset = Path(self.dataset_var.get())
-            if not dataset.is_dir():
-                raise ValueError("Select the recorded action dataset folder first.")
+            dataset = self.dataset_var.get()
+            directories = dataset_directories(dataset)
+            if not directories or any(not directory.is_dir() for directory in directories):
+                raise ValueError("Select one or more recorded action dataset folders first.")
             report, _pairs = inspect_action_dataset(dataset, int(self.frame_gap.get()), self.action_aggregation.get())
             problems = []
             warnings = []
@@ -2146,9 +2227,10 @@ class TrainTab(ttk.Frame):
             return self.start(benchmark=True, preflight=True)
         try:
             self.save_training_settings(silent=True)
-            dataset = Path(self.dataset_var.get())
-            if not dataset.is_dir():
-                raise ValueError("Select the recorded action dataset folder.")
+            dataset = self.dataset_var.get()
+            directories = dataset_directories(dataset)
+            if not directories or any(not directory.is_dir() for directory in directories):
+                raise ValueError("Select one or more recorded action dataset folders.")
             frame_gap = int(self.frame_gap.get())
             action_aggregation = self.action_aggregation.get()
             report, pairs = inspect_action_dataset(dataset, frame_gap, action_aggregation)
