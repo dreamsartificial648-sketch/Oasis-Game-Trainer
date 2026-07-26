@@ -304,7 +304,7 @@ class RobloxActionRecorder:
         self.root = root
         self.root.title("Game Action Dataset Recorder")
         self.root.geometry("1020x840")
-        self.root.minsize(840, 620)
+        self.root.minsize(1020, 840)
         self.root.configure(bg=APP_BG)
 
         self.output_dir = Path.cwd() / "roblox_action_dataset"
@@ -387,10 +387,11 @@ class RobloxActionRecorder:
 
         controls_shell = ttk.Frame(body, style="Card.TFrame")
         controls_shell.grid(row=0, column=0, sticky="ns", padx=(0, 14))
+        controls_shell.rowconfigure(0, weight=1)
         self.controls_canvas = tk.Canvas(controls_shell, bg=PANEL, highlightthickness=0, width=310)
         controls_scrollbar = ttk.Scrollbar(controls_shell, orient="vertical", command=self.controls_canvas.yview)
         self.controls_canvas.configure(yscrollcommand=controls_scrollbar.set)
-        self.controls_canvas.grid(row=0, column=0, sticky="ns")
+        self.controls_canvas.grid(row=0, column=0, sticky="nsew")
         controls_scrollbar.grid(row=0, column=1, sticky="ns")
         controls = ttk.Frame(self.controls_canvas, style="Card.TFrame", padding=14)
         self.controls_window = self.controls_canvas.create_window((0, 0), window=controls, anchor="nw")

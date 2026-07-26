@@ -15,10 +15,11 @@ import threading
 import time
 import traceback
 import uuid
+import zipfile
 from pathlib import Path
 
 import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox, simpledialog, ttk
 
 APP_DIR = Path(__file__).resolve().parent
 SOURCE_APP_NAMES = ["flow_matching_app(13).py", "flow_matching_app.py"]
@@ -256,6 +257,149 @@ def analyze_reference_motion(video_path, max_samples=180):
     }
 
 
+def motion_aware_stabilize(previous_image, generated_image, strength):
+    """Align the old view to the new frame and reuse only trustworthy pixels."""
+    strength = max(0.0, min(1.0, float(strength)))
+    if strength <= 0.0:
+        return generated_image
+
+    import cv2
+    import numpy as np
+    from PIL import Image
+
+    previous_rgb = np.asarray(previous_image.convert("RGB"), dtype=np.uint8)
+    generated_rgb = np.asarray(generated_image.convert("RGB"), dtype=np.uint8)
+    if previous_rgb.shape != generated_rgb.shape:
+        return generated_image
+
+    previous_gray = cv2.cvtColor(previous_rgb, cv2.COLOR_RGB2GRAY)
+    generated_gray = cv2.cvtColor(generated_rgb, cv2.COLOR_RGB2GRAY)
+
+    # Backward flow tells each new-frame pixel where to sample the old frame.
+    backward = cv2.calcOpticalFlowFarneback(
+        generated_gray, previous_gray, None, 0.5, 3, 15, 3, 5, 1.2, 0,
+    )
+    forward = cv2.calcOpticalFlowFarneback(
+        previous_gray, generated_gray, None, 0.5, 3, 15, 3, 5, 1.2, 0,
+    )
+    height, width = generated_gray.shape
+    grid_x, grid_y = np.meshgrid(
+        np.arange(width, dtype=np.float32),
+        np.arange(height, dtype=np.float32),
+    )
+    map_x = grid_x + backward[..., 0]
+    map_y = grid_y + backward[..., 1]
+    valid = (
+        (map_x >= 0.0) & (map_x <= width - 1.0) &
+        (map_y >= 0.0) & (map_y <= height - 1.0)
+    ).astype(np.float32)
+
+    warped_previous = cv2.remap(
+        previous_rgb, map_x, map_y, cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_CONSTANT, borderValue=0,
+    )
+
+    # Forward/backward disagreement catches occlusions and unreliable motion.
+    sampled_forward_x = cv2.remap(
+        forward[..., 0], map_x, map_y, cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_CONSTANT, borderValue=0,
+    )
+    sampled_forward_y = cv2.remap(
+        forward[..., 1], map_x, map_y, cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_CONSTANT, borderValue=0,
+    )
+    consistency_error = np.sqrt(
+        (backward[..., 0] + sampled_forward_x) ** 2 +
+        (backward[..., 1] + sampled_forward_y) ** 2
+    )
+    motion_confidence = np.clip(1.0 - consistency_error / 1.5, 0.0, 1.0)
+
+    # Changed content and newly exposed regions should come from the model alone.
+    color_error = np.mean(
+        np.abs(warped_previous.astype(np.float32) - generated_rgb.astype(np.float32)),
+        axis=2,
+    ) / 255.0
+    appearance_confidence = np.clip((0.12 - color_error) / 0.08, 0.0, 1.0)
+    confidence = valid * motion_confidence * appearance_confidence
+    confidence = cv2.GaussianBlur(confidence, (0, 0), 0.8)
+    alpha = (confidence * strength)[..., None]
+
+    stabilized = (
+        generated_rgb.astype(np.float32) * (1.0 - alpha) +
+        warped_previous.astype(np.float32) * alpha
+    )
+    return Image.fromarray(np.clip(stabilized, 0, 255).astype(np.uint8), "RGB")
+
+
+def interpolate_motion_frames(previous_image, next_image, multiplier):
+    """Create optical-flow in-betweens without feeding them back into inference."""
+    multiplier = max(1, int(multiplier))
+    if multiplier == 1:
+        return [next_image]
+
+    import cv2
+    import numpy as np
+    from PIL import Image
+
+    previous_rgb = np.asarray(previous_image.convert("RGB"), dtype=np.uint8)
+    next_rgb = np.asarray(next_image.convert("RGB"), dtype=np.uint8)
+    if previous_rgb.shape != next_rgb.shape:
+        return [next_image] * multiplier
+
+    previous_gray = cv2.cvtColor(previous_rgb, cv2.COLOR_RGB2GRAY)
+    next_gray = cv2.cvtColor(next_rgb, cv2.COLOR_RGB2GRAY)
+    forward = cv2.calcOpticalFlowFarneback(
+        previous_gray, next_gray, None, 0.5, 3, 15, 3, 5, 1.2, 0,
+    )
+    backward = cv2.calcOpticalFlowFarneback(
+        next_gray, previous_gray, None, 0.5, 3, 15, 3, 5, 1.2, 0,
+    )
+    height, width = previous_gray.shape
+    grid_x, grid_y = np.meshgrid(
+        np.arange(width, dtype=np.float32),
+        np.arange(height, dtype=np.float32),
+    )
+
+    frames = []
+    for index in range(1, multiplier + 1):
+        amount = index / multiplier
+        if index == multiplier:
+            frames.append(next_image)
+            continue
+        previous_map_x = grid_x - forward[..., 0] * amount
+        previous_map_y = grid_y - forward[..., 1] * amount
+        next_map_x = grid_x - backward[..., 0] * (1.0 - amount)
+        next_map_y = grid_y - backward[..., 1] * (1.0 - amount)
+        warped_previous = cv2.remap(
+            previous_rgb, previous_map_x, previous_map_y, cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_REFLECT,
+        )
+        warped_next = cv2.remap(
+            next_rgb, next_map_x, next_map_y, cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_REFLECT,
+        )
+        blended = (
+            warped_previous.astype(np.float32) * (1.0 - amount) +
+            warped_next.astype(np.float32) * amount
+        )
+        frames.append(Image.fromarray(np.clip(blended, 0, 255).astype(np.uint8), "RGB"))
+    return frames
+
+
+def subdivide_action_values(action_values, subdivisions):
+    """Slow continuous controls across more genuine model frames."""
+    subdivisions = max(1, int(subdivisions))
+    if subdivisions == 1:
+        return list(action_values)
+    scaled = list(action_values)
+    amount = 1.0 / subdivisions
+    # W/A/S/D and camera/zoom are continuous motion. Jump remains a full
+    # impulse because fractional jump values were not present in training.
+    for index in (0, 1, 2, 3, 5, 6, 7):
+        scaled[index] *= amount
+    return scaled
+
+
 def find_source_app():
     for name in SOURCE_APP_NAMES:
         candidate = APP_DIR / name
@@ -293,6 +437,64 @@ def action_model_is_valid(path):
         return info.get("model_type") == "action_conditioned_rectified_flow_video" and (path / "unet" / "config.json").is_file()
     except Exception:
         return False
+
+
+def import_action_model_package(source_path):
+    """Register a viewer-supplied action model folder or a Kaggle ZIP package.
+
+    A folder is copied into the app's model library so the player keeps working
+    even if the original download location changes.  ZIP files may contain the
+    model directly or inside one top-level release folder.
+    """
+    source = Path(source_path)
+    if not source.exists():
+        raise ValueError("The selected model file or folder no longer exists.")
+    ACTION_MODELS_DIR.mkdir(parents=True, exist_ok=True)
+    temporary = None
+    try:
+        if source.is_file():
+            if source.suffix.lower() != ".zip":
+                raise ValueError("Choose a model folder or a .zip model package.")
+            temporary = ACTION_MODELS_DIR / f".importing_{uuid.uuid4().hex}"
+            temporary.mkdir()
+            with zipfile.ZipFile(source) as archive:
+                members = archive.infolist()
+                if not members:
+                    raise ValueError("That ZIP package is empty.")
+                for member in members:
+                    target = (temporary / member.filename).resolve()
+                    if temporary.resolve() not in target.parents and target != temporary.resolve():
+                        raise ValueError("The ZIP contains an unsafe file path.")
+                archive.extractall(temporary)
+            candidates = [temporary] + [path for path in temporary.rglob("*") if path.is_dir()]
+            model_source = next((path for path in candidates if action_model_is_valid(path)), None)
+            if model_source is None:
+                raise ValueError(
+                    "This package does not contain a compatible Action Flow model. "
+                    "It needs action_flow_model_info.json and unet/config.json."
+                )
+            preferred_name = source.stem
+        else:
+            if not action_model_is_valid(source):
+                raise ValueError(
+                    "That folder is not a compatible Action Flow model. "
+                    "Choose the folder containing action_flow_model_info.json and unet."
+                )
+            model_source = source
+            preferred_name = source.name
+
+        safe_name = "".join(char if char.isalnum() or char in " -_." else "_" for char in preferred_name).strip(" .")
+        safe_name = safe_name or "Action Model"
+        destination = ACTION_MODELS_DIR / safe_name
+        index = 2
+        while destination.exists():
+            destination = ACTION_MODELS_DIR / f"{safe_name} ({index})"
+            index += 1
+        shutil.copytree(model_source, destination)
+        return destination
+    finally:
+        if temporary is not None:
+            shutil.rmtree(temporary, ignore_errors=True)
 
 
 def expand_unet_for_actions(model, action_dim=ACTION_DIM):
@@ -684,6 +886,84 @@ def dataset_directories(value):
     return directories
 
 
+def native_dataset_folder_picker(owner, title):
+    """Use Windows' native folder picker with its built-in multi-select support."""
+    if os.name != "nt":
+        value = filedialog.askdirectory(parent=owner, title=title)
+        return [Path(value)] if value else []
+
+    # Tk's askdirectory exposes the Windows folder dialog but not its multi-select
+    # flag.  IFileOpenDialog is that same native dialog and supports both folders
+    # and Ctrl/Shift selection when FOS_ALLOWMULTISELECT is enabled.
+    import ctypes
+    from ctypes import wintypes
+
+    ole32 = ctypes.OleDLL("ole32")
+    co_task_mem_free = ole32.CoTaskMemFree
+    co_task_mem_free.argtypes = [ctypes.c_void_p]
+    co_initialize = ole32.CoInitializeEx
+    co_initialize.argtypes = [ctypes.c_void_p, wintypes.DWORD]
+    co_uninitialize = ole32.CoUninitialize
+
+    def guid(value):
+        import uuid
+        raw = uuid.UUID(value).bytes_le
+        return (ctypes.c_byte * 16).from_buffer_copy(raw)
+
+    def method(pointer, slot, restype, *argtypes):
+        address = ctypes.cast(pointer, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p))).contents[slot]
+        return ctypes.WINFUNCTYPE(restype, ctypes.c_void_p, *argtypes)(address)
+
+    # CoInitializeEx may return S_FALSE when this thread already has COM ready;
+    # either success code is safe to pair with CoUninitialize.
+    initialized = co_initialize(None, 0x2) >= 0  # COINIT_APARTMENTTHREADED
+    dialog = ctypes.c_void_p()
+    results = ctypes.c_void_p()
+    paths = []
+    try:
+        hr = ole32.CoCreateInstance(
+            ctypes.byref(guid("DC1C5A9C-E88A-4DDE-A5A1-60F82A20AEF7")), None, 1,
+            ctypes.byref(guid("D57C7288-D4AD-4768-BE02-9D969532D960")), ctypes.byref(dialog),
+        )
+        if hr < 0:
+            raise OSError("Windows could not open the folder picker.")
+        get_options = method(dialog, 10, ctypes.c_long, ctypes.POINTER(wintypes.DWORD))
+        set_options = method(dialog, 9, ctypes.c_long, wintypes.DWORD)
+        set_title = method(dialog, 17, ctypes.c_long, wintypes.LPCWSTR)
+        show = method(dialog, 3, ctypes.c_long, wintypes.HWND)
+        get_results = method(dialog, 27, ctypes.c_long, ctypes.POINTER(ctypes.c_void_p))
+        options = wintypes.DWORD()
+        get_options(dialog, ctypes.byref(options))
+        # FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST | FOS_ALLOWMULTISELECT
+        set_options(dialog, options.value | 0x20 | 0x40 | 0x800 | 0x200)
+        set_title(dialog, title)
+        if show(dialog, owner.winfo_id()) < 0:  # User cancelled.
+            return []
+        if get_results(dialog, ctypes.byref(results)) < 0:
+            return []
+        get_count = method(results, 7, ctypes.c_long, ctypes.POINTER(wintypes.DWORD))
+        get_item_at = method(results, 8, ctypes.c_long, wintypes.DWORD, ctypes.POINTER(ctypes.c_void_p))
+        count = wintypes.DWORD()
+        get_count(results, ctypes.byref(count))
+        for index in range(count.value):
+            item = ctypes.c_void_p()
+            if get_item_at(results, index, ctypes.byref(item)) >= 0:
+                display_name = ctypes.c_wchar_p()
+                get_display_name = method(item, 5, ctypes.c_long, wintypes.DWORD, ctypes.POINTER(ctypes.c_wchar_p))
+                if get_display_name(item, 0x80058000, ctypes.byref(display_name)) >= 0:
+                    paths.append(Path(display_name.value))
+                    co_task_mem_free(display_name)
+                method(item, 2, ctypes.c_ulong)(item)
+        return paths
+    finally:
+        if results.value:
+            method(results, 2, ctypes.c_ulong)(results)
+        if dialog.value:
+            method(dialog, 2, ctypes.c_ulong)(dialog)
+        if initialized:
+            co_uninitialize()
+
+
 def inspect_action_dataset(dataset_dir, frame_gap=1, action_aggregation="window"):
     """Inspect one or more independent recorder folders as one training set.
 
@@ -777,6 +1057,27 @@ def select_training_chunk(pairs, chunk_size=0, chunk_offset=0, mode="balanced", 
     return [pairs[index] for index in selected]
 
 
+class ReplaySampler:
+    """Use every new transition and a freshly sampled old-data replay buffer per epoch."""
+    def __init__(self, new_indexes, old_indexes, replay_count, seed=1234):
+        self.new_indexes = list(new_indexes)
+        self.old_indexes = list(old_indexes)
+        self.replay_count = max(0, int(replay_count))
+        self.seed = int(seed)
+        self.epoch = 0
+
+    def __iter__(self):
+        rng = random.Random(self.seed + self.epoch)
+        self.epoch += 1
+        count = min(self.replay_count, len(self.old_indexes))
+        indexes = list(self.new_indexes) + rng.sample(self.old_indexes, count)
+        rng.shuffle(indexes)
+        return iter(indexes)
+
+    def __len__(self):
+        return len(self.new_indexes) + min(self.replay_count, len(self.old_indexes))
+
+
 class ActionPairDataset:
     def __init__(self, pairs, resolution, condition_noise=0.03):
         from torchvision import transforms
@@ -856,6 +1157,7 @@ def save_action_model(model, output_dir, args, epoch, stopped=False):
         "contrast_samples": int(getattr(args, "contrast_samples", 2)),
         "chunk_size": int(getattr(args, "chunk_size", 0)),
         "chunk_mode": str(getattr(args, "chunk_mode", "balanced")),
+        "replay_older_percent": float(getattr(args, "replay_older_percent", 0.0)),
         "chunk_seed": int(getattr(args, "chunk_seed", 1234)),
         "balance_actions": bool(getattr(args, "balance_actions", False)),
         "frame_gap": int(getattr(args, "frame_gap", 1)),
@@ -1102,6 +1404,7 @@ def training_worker(args):
 
     args.neutral_action_dropout = max(0.0, min(0.9, float(args.neutral_action_dropout)))
     args.motion_loss_weight = max(0.0, float(args.motion_loss_weight))
+    args.replay_older_percent = max(0.0, float(args.replay_older_percent))
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if device.type == "cuda":
@@ -1122,6 +1425,17 @@ def training_worker(args):
         pairs, args.chunk_size, args.chunk_offset,
         mode=args.chunk_mode, seed=args.chunk_seed,
     )
+    # The first selected folder is the newly added data.  Every later folder is
+    # retained as a replay pool, so a short fine-tune still receives an explicit
+    # learning signal for prior games instead of optimizing only the new game.
+    directories = dataset_directories(args.dataset_dir)
+    old_pair_keys = set()
+    if args.replay_older_percent > 0 and len(directories) > 1:
+        for directory in directories[1:]:
+            _old_report, old_pairs = _inspect_action_dataset(
+                directory, args.frame_gap, args.action_aggregation,
+            )
+            old_pair_keys.update((str(previous), str(target)) for previous, target, _action in old_pairs)
     if len(pairs) < 2:
         raise ValueError("The selected training chunk contains fewer than two transitions.")
     action_counts, enabled_action_names, observed_binary_actions, observed_action_prototypes = observed_action_profiles(pairs)
@@ -1162,36 +1476,60 @@ def training_worker(args):
     if args.workers > 0:
         loader_kwargs["prefetch_factor"] = 2
     sampler = None
-    if args.balance_actions:
-        # Oversample transitions containing less common controls (including signed
-        # camera/zoom movement) without
-        # rewriting files or metadata. A cap avoids turning a handful of rare clips
-        # into almost every batch.
-        selected_actions = [pairs[index][2] for index in train_dataset.indices]
-        counts = [
-            sum(abs(float(action[i])) > (0.5 if i < 5 else 0.02) for action in selected_actions)
-            for i in range(ACTION_DIM)
-        ]
-        reference = max(1, max(counts))
-        weights = []
-        for action in selected_actions:
-            active = [
-                i for i, value in enumerate(action)
-                if abs(float(value)) > (0.5 if i < 5 else 0.02)
-            ]
-            if active:
-                weight = max(min(8.0, math.sqrt(reference / max(1, counts[i]))) for i in active)
+    replay_count = 0
+    if old_pair_keys:
+        new_local_indexes = []
+        old_local_indexes = []
+        for local_index, pair_index in enumerate(train_dataset.indices):
+            previous_path, target_path, _action = pairs[pair_index]
+            if (str(previous_path), str(target_path)) in old_pair_keys:
+                old_local_indexes.append(local_index)
             else:
-                weight = 1.0
-            weights.append(weight)
-        sampler = WeightedRandomSampler(
-            torch.as_tensor(weights, dtype=torch.double),
-            num_samples=len(train_dataset), replacement=True,
-            generator=torch.Generator().manual_seed(4321),
-        )
-        loader_kwargs["sampler"] = sampler
-    else:
-        loader_kwargs["shuffle"] = True
+                new_local_indexes.append(local_index)
+        replay_count = math.ceil(len(new_local_indexes) * float(args.replay_older_percent) / 100.0)
+        if old_local_indexes and replay_count:
+            sampler = ReplaySampler(
+                new_local_indexes, old_local_indexes, replay_count, args.chunk_seed,
+            )
+            loader_kwargs["sampler"] = sampler
+            event(
+                type="warning",
+                message=(
+                    f"Replay active: each epoch uses {len(new_local_indexes):,} new transitions plus "
+                    f"{min(replay_count, len(old_local_indexes)):,} randomly refreshed older transitions. "
+                    "Action balancing is disabled for this run so the replay ratio is exact."
+                ),
+            )
+    if sampler is None:
+        if args.balance_actions:
+            # Oversample transitions containing less common controls (including signed
+            # camera/zoom movement) without rewriting files or metadata. A cap avoids
+            # turning a handful of rare clips into almost every batch.
+            selected_actions = [pairs[index][2] for index in train_dataset.indices]
+            counts = [
+                sum(abs(float(action[i])) > (0.5 if i < 5 else 0.02) for action in selected_actions)
+                for i in range(ACTION_DIM)
+            ]
+            reference = max(1, max(counts))
+            weights = []
+            for action in selected_actions:
+                active = [
+                    i for i, value in enumerate(action)
+                    if abs(float(value)) > (0.5 if i < 5 else 0.02)
+                ]
+                if active:
+                    weight = max(min(8.0, math.sqrt(reference / max(1, counts[i]))) for i in active)
+                else:
+                    weight = 1.0
+                weights.append(weight)
+            sampler = WeightedRandomSampler(
+                torch.as_tensor(weights, dtype=torch.double),
+                num_samples=len(train_dataset), replacement=True,
+                generator=torch.Generator().manual_seed(4321),
+            )
+            loader_kwargs["sampler"] = sampler
+        else:
+            loader_kwargs["shuffle"] = True
     loader = DataLoader(train_dataset, **loader_kwargs)
     val_loader = DataLoader(
         val_dataset,
@@ -1651,6 +1989,35 @@ class Field(ttk.Frame):
         return self.var.get()
 
 
+class CollapsibleSection(ttk.Frame):
+    """A compact, keyboard-friendly disclosure panel for the fine-tuning form."""
+    def __init__(self, parent, title, subtitle="", expanded=True):
+        super().__init__(parent, style="Card.TFrame", padding=14)
+        self.expanded = tk.BooleanVar(value=expanded)
+        header = ttk.Frame(self, style="Card.TFrame")
+        header.pack(fill="x")
+        self.button = ttk.Button(header, command=self.toggle)
+        self.button.pack(side="left")
+        ttk.Label(header, text=title, style="CardHeading.TLabel").pack(side="left", padx=(8, 0))
+        if subtitle:
+            ttk.Label(header, text=subtitle, style="Meta.TLabel").pack(side="left", padx=(10, 0))
+        self.body = ttk.Frame(self, style="Card.TFrame")
+        if expanded:
+            self.body.pack(fill="x", pady=(10, 0))
+        self._refresh_button()
+
+    def _refresh_button(self):
+        self.button.config(text="Hide" if self.expanded.get() else "Show")
+
+    def toggle(self):
+        self.expanded.set(not self.expanded.get())
+        if self.expanded.get():
+            self.body.pack(fill="x", pady=(10, 0))
+        else:
+            self.body.pack_forget()
+        self._refresh_button()
+
+
 class TrainingSpeedChart(tk.Canvas):
     """Small dependency-free timeline for explaining changing training ETAs."""
     def __init__(self, parent):
@@ -1758,6 +2125,10 @@ class TrainTab(ttk.Frame):
         self.events = queue.Queue()
         self.preview_photo = None
         self._settings_loaded = False
+        self._applying_preset = False
+        self.preset_var = tk.StringVar(value="Default")
+        self.include_older_data_var = tk.BooleanVar(value=True)
+        self.saved_presets = {}
         self._build()
         self.load_training_settings()
         self._install_settings_autosave()
@@ -1771,8 +2142,9 @@ class TrainTab(ttk.Frame):
             style="Body.TLabel",
         ).pack(anchor="w", padx=18, pady=(0, 12))
 
-        card = ttk.Frame(content, style="Card.TFrame", padding=14)
-        card.pack(fill="x", padx=18, pady=5)
+        setup_section = CollapsibleSection(content, "Dataset & model", "What to train and where to save it")
+        setup_section.pack(fill="x", padx=18, pady=5)
+        card = setup_section.body
 
         self.dataset_var = tk.StringVar()
         self.base_model_var = tk.StringVar()
@@ -1795,7 +2167,7 @@ class TrainTab(ttk.Frame):
 
         ttk.Label(
             card,
-            text="Use Browse to choose the first recording, then Add Dataset to include older recordings. Folders are combined for training only; no files are moved or changed.",
+            text="Browse and Add Dataset both support multi-select: click and drag across folders to highlight them, or use Ctrl/Shift-click. Folders are combined for training only; no files are moved or changed.",
             style="Meta.TLabel", wraplength=900, justify="left",
         ).pack(anchor="w", pady=(5, 0))
         ttk.Button(card, text="Add Dataset", command=self.add_dataset).pack(anchor="w", pady=(3, 4))
@@ -1812,14 +2184,39 @@ class TrainTab(ttk.Frame):
         ttk.Label(card, text="Model name", style="Meta.TLabel").pack(anchor="w", pady=(8, 0))
         ttk.Entry(card, textvariable=self.name_var, style="Field.TEntry").pack(fill="x", pady=(3, 6))
 
-        settings_buttons = ttk.Frame(card, style="Card.TFrame")
+        strategy_section = CollapsibleSection(content, "Fine-tuning strategy", "Presets, sampling, quality, and performance")
+        strategy_section.pack(fill="x", padx=18, pady=5)
+        strategy_card = strategy_section.body
+        preset_line = ttk.Frame(strategy_card, style="Card.TFrame")
+        preset_line.pack(fill="x", pady=(0, 8))
+        ttk.Label(preset_line, text="Training strategy", style="Meta.TLabel").pack(side="left")
+        self.preset_combo = ttk.Combobox(preset_line, textvariable=self.preset_var, state="readonly", width=28)
+        self.preset_combo.pack(side="left", padx=(8, 0))
+        self.preset_combo.bind("<<ComboboxSelected>>", self._select_preset)
+        ttk.Button(preset_line, text="Rename", command=self.rename_selected_preset).pack(side="left", padx=(8, 0))
+        ttk.Button(preset_line, text="Delete", command=self.delete_selected_preset).pack(side="left", padx=(8, 0))
+        ttk.Button(preset_line, text="Save Current as…", command=self.save_named_preset).pack(side="left", padx=(8, 0))
+        ttk.Label(strategy_card, text="Presets change training options only; dataset, model, continuation, name, and output folders stay as they are.", style="Meta.TLabel").pack(anchor="w", pady=(0, 8))
+
+        ttk.Label(
+            strategy_card,
+            text=(
+                "Large Dataset +10K uses a balanced 5,000-transition slice for faster epochs; "
+                "change Chunk seed/offset for a new slice."
+            ),
+            style="Meta.TLabel",
+            wraplength=880,
+            justify="left",
+        ).pack(anchor="w", pady=(0, 8))
+
+        settings_buttons = ttk.Frame(strategy_card, style="Card.TFrame")
         settings_buttons.pack(fill="x", pady=(4, 8))
         ttk.Button(settings_buttons, text="Check Dataset", command=self.check_dataset).pack(side="left")
         ttk.Button(settings_buttons, text="Import Settings TXT/JSON", command=self.import_training_settings).pack(side="left")
         ttk.Button(settings_buttons, text="Export Current Settings", command=self.export_training_settings).pack(side="left", padx=(8, 0))
         ttk.Label(settings_buttons, text="Settings also autosave when changed.", style="Meta.TLabel").pack(side="left", padx=(12, 0))
 
-        grid = ttk.Frame(card, style="Card.TFrame")
+        grid = ttk.Frame(strategy_card, style="Card.TFrame")
         grid.pack(fill="x")
         self.epochs = Field(grid, "Epochs", "30")
         self.resolution = Field(
@@ -1848,7 +2245,8 @@ class TrainTab(ttk.Frame):
         self.contrast_samples = Field(grid, "Contrast samples on scheduled batch", "2", ["2", "3", "4", "5"])
         self.chunk_size = Field(grid, "Transitions per training chunk (0 = all)", "0", ["0", "384", "1000", "2000", "3000", "4000", "5000"])
         self.chunk_mode = Field(grid, "Chunk selection", "balanced", ["balanced", "random", "sequential"])
-        self.chunk_offset = Field(grid, "Chunk seed/offset", "0")
+        self.replay_older_percent = Field(grid, "Older-data replay per epoch (% of new)", "50", ["0", "25", "50", "100", "200"])
+        self.chunk_offset = Field(grid, "Chunk seed/offset (new slice)", "0")
         self.chunk_seed = Field(grid, "Chunk random seed", "1234")
         self.benchmark_batches = Field(grid, "Speed-test batches", "8", ["5", "8", "12", "20"])
         self.recovery_minutes = Field(grid, "Emergency recovery every minutes (0 = off)", "30", ["0", "15", "30", "45", "60"])
@@ -1867,7 +2265,7 @@ class TrainTab(ttk.Frame):
             self.action_scale, self.neutral_dropout, self.motion_loss_weight,
             self.contrast_weight, self.contrast_margin,
             self.contrast_every, self.contrast_samples,
-            self.chunk_size, self.chunk_mode, self.chunk_offset, self.chunk_seed,
+            self.chunk_size, self.chunk_mode, self.replay_older_percent, self.chunk_offset, self.chunk_seed,
             self.benchmark_batches, self.recovery_minutes,
             self.save_every, self.preview_every, self.preview_steps,
             self.preview_display_width, self.precision,
@@ -1880,15 +2278,21 @@ class TrainTab(ttk.Frame):
         self.tf32_var = tk.BooleanVar(value=True)
         self.ckpt_var = tk.BooleanVar(value=False)
         self.balance_actions_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(card, text="Use TF32 acceleration", variable=self.tf32_var).pack(anchor="w", pady=(8, 2))
-        ttk.Checkbutton(card, text="Gradient checkpointing", variable=self.ckpt_var).pack(anchor="w")
+        ttk.Checkbutton(strategy_card, text="Use TF32 acceleration", variable=self.tf32_var).pack(anchor="w", pady=(8, 2))
+        ttk.Checkbutton(strategy_card, text="Gradient checkpointing", variable=self.ckpt_var).pack(anchor="w")
         ttk.Checkbutton(
-            card,
-            text="Balance movement, camera, and zoom sampling (does not alter dataset files)",
+            strategy_card,
+            text="Balance movement, camera, and zoom sampling (operational; does not alter dataset files)",
             variable=self.balance_actions_var,
         ).pack(anchor="w", pady=(2, 0))
+        ttk.Checkbutton(
+            strategy_card,
+            text="Mix added older recordings into this run (operational; combined transition pool)",
+            variable=self.include_older_data_var,
+        ).pack(anchor="w", pady=(2, 0))
+        ttk.Label(strategy_card, text="Replay uses the first selected folder as new data and randomly refreshes examples from every later folder each epoch. Add older folders with Add Dataset. LoRA and layer freezing are not available yet.", style="Meta.TLabel", wraplength=880, justify="left").pack(anchor="w", pady=(2, 0))
 
-        buttons = ttk.Frame(card, style="Card.TFrame")
+        buttons = ttk.Frame(strategy_card, style="Card.TFrame")
         buttons.pack(fill="x", pady=(12, 0))
         self.start_btn = ttk.Button(buttons, text="Start Action Training", command=self.start, style="Accent.TButton")
         self.start_btn.pack(side="left")
@@ -1897,11 +2301,11 @@ class TrainTab(ttk.Frame):
         self.stop_btn = ttk.Button(buttons, text="Stop && Save", command=self.stop, state="disabled")
         self.stop_btn.pack(side="left", padx=8)
 
-        self.progress = ttk.Progressbar(card, mode="determinate")
+        self.progress = ttk.Progressbar(strategy_card, mode="determinate")
         self.progress.pack(fill="x", pady=(10, 5))
-        self.status = ttk.Label(card, text="Ready.", style="Body.TLabel")
+        self.status = ttk.Label(strategy_card, text="Ready.", style="Body.TLabel")
         self.status.pack(anchor="w")
-        self.speed_chart = TrainingSpeedChart(card)
+        self.speed_chart = TrainingSpeedChart(strategy_card)
         self.speed_chart.pack(fill="x", pady=(8, 0))
 
         preview_card = ttk.Frame(content, style="Card.TFrame", padding=10)
@@ -1940,6 +2344,7 @@ class TrainTab(ttk.Frame):
             "contrast_samples": self.contrast_samples.var,
             "chunk_size": self.chunk_size.var,
             "chunk_mode": self.chunk_mode.var,
+            "replay_older_percent": self.replay_older_percent.var,
             "chunk_offset": self.chunk_offset.var,
             "chunk_seed": self.chunk_seed.var,
             "benchmark_batches": self.benchmark_batches.var,
@@ -1952,13 +2357,174 @@ class TrainTab(ttk.Frame):
             "tf32": self.tf32_var,
             "gradient_checkpointing": self.ckpt_var,
             "balance_actions": self.balance_actions_var,
+            "include_older_data": self.include_older_data_var,
         }
+
+    @staticmethod
+    def _preset_settings(settings):
+        """Keep machine- and project-specific paths out of training strategies."""
+        excluded = {
+            "dataset_dir", "base_model", "continue_action_model", "model_name", "output_dir",
+            "format", "selected_preset", "saved_presets",
+        }
+        return {key: value for key, value in settings.items() if key not in excluded}
+
+    @staticmethod
+    def builtin_presets():
+        """Settings intentionally limited to knobs implemented by training_worker."""
+        default = {
+            "epochs": "30", "resolution": "256x144", "batch_size": "2",
+            "learning_rate": "0.00002", "workers": "4", "gradient_accumulation": "1",
+            "condition_noise": "0.03", "temporal_loss_weight": "0.1", "validation_split": "0.1",
+            "frame_gap": "3", "action_aggregation": "window", "action_input_scale": "8.0",
+            "neutral_action_dropout": "0.15", "motion_loss_weight": "2.0",
+            "action_contrast_weight": "0.35", "action_contrast_margin": "0.02",
+            "contrast_every": "4", "contrast_samples": "2", "chunk_size": "0", "replay_older_percent": "50",
+            "chunk_mode": "balanced", "chunk_offset": "0", "chunk_seed": "1234",
+            "benchmark_batches": "8", "recovery_minutes": "30", "save_every": "10",
+            "preview_every": "5", "preview_steps": "1", "preview_display_width": "1000",
+            "mixed_precision": "fp16", "tf32": True, "gradient_checkpointing": False,
+            "balance_actions": True, "include_older_data": True,
+        }
+        return {
+            "Default": default,
+            "Add New Game": {
+                "learning_rate": "0.00005", "epochs": "40", "frame_gap": "3",
+                "balance_actions": True, "include_older_data": False,
+            },
+            "Add Actions / Poses": {
+                "learning_rate": "0.00002", "epochs": "30", "frame_gap": "3",
+                "action_input_scale": "8.0", "action_contrast_weight": "0.35",
+                "balance_actions": True,
+            },
+            "Add Both": {
+                "learning_rate": "0.00005", "epochs": "45", "frame_gap": "3",
+                "action_input_scale": "8.0", "action_contrast_weight": "0.35",
+                "balance_actions": True, "include_older_data": True,
+            },
+            "Game-Specific Model": {
+                "learning_rate": "0.00002", "epochs": "30", "frame_gap": "3",
+                "balance_actions": True, "include_older_data": True,
+            },
+            "Large Dataset +10K": {
+                # A balanced sample keeps rare actions represented while bounding each
+                # epoch. Raise the offset for another deterministic sample on a later
+                # continuation run, rather than repeatedly training one fixed slice.
+                "epochs": "45", "learning_rate": "0.00002", "workers": "8",
+                "gradient_accumulation": "1", "validation_split": "0.1",
+                "chunk_size": "5000", "chunk_mode": "balanced", "chunk_offset": "0",
+                "chunk_seed": "1234", "balance_actions": True,
+                "include_older_data": True, "recovery_minutes": "30",
+            },
+        }
+
+    def _refresh_preset_options(self):
+        names = list(self.builtin_presets()) + sorted(self.saved_presets, key=str.lower)
+        self.preset_combo["values"] = names
+        if self.preset_var.get() not in names:
+            self.preset_var.set("Default")
+
+    def _select_preset(self, _event=None):
+        name = self.preset_var.get()
+        preset = self.builtin_presets().get(name, self.saved_presets.get(name))
+        if preset is None:
+            return
+        self._applying_preset = True
+        try:
+            self.apply_training_settings(self._preset_settings(preset))
+        finally:
+            self._applying_preset = False
+        self.save_training_settings(silent=True)
+        if name == "Large Dataset +10K":
+            self.status.config(
+                text=(
+                    "Applied Large Dataset +10K: balanced 5,000-transition slice, "
+                    "45 fast epochs. Change Chunk seed/offset for the next slice."
+                )
+            )
+        else:
+            self.status.config(text=f"Applied training strategy: {name}.")
+
+    def save_named_preset(self):
+        name = simpledialog.askstring("Save training strategy", "Name this saved training strategy:", parent=self)
+        if name is None:
+            return
+        name = name.strip()
+        if not name:
+            messagebox.showerror("Preset name required", "Enter a name for the saved training strategy.")
+            return
+        if name in self.builtin_presets():
+            messagebox.showerror("Reserved preset name", "Choose a name other than one of the built-in presets.")
+            return
+        self.saved_presets[name] = self._preset_settings(self.collect_training_settings())
+        self._refresh_preset_options()
+        self.preset_var.set(name)
+        self.save_training_settings(silent=True)
+        self.status.config(text=f"Saved training strategy: {name}.")
+
+    def rename_selected_preset(self):
+        """Rename a user-created strategy without changing its saved settings."""
+        old_name = self.preset_var.get().strip()
+        if old_name in self.builtin_presets():
+            messagebox.showinfo(
+                "Built-in strategy",
+                "Built-in training strategies cannot be renamed. Save it under a new name to make an editable copy.",
+            )
+            return
+        if old_name not in self.saved_presets:
+            messagebox.showerror("Strategy not found", "Choose a saved training strategy to rename.")
+            return
+        new_name = simpledialog.askstring(
+            "Rename training strategy", "New strategy name:", initialvalue=old_name, parent=self,
+        )
+        if new_name is None:
+            return
+        new_name = new_name.strip()
+        if not new_name:
+            messagebox.showerror("Strategy name required", "Enter a name for the training strategy.")
+            return
+        if new_name != old_name and (new_name in self.builtin_presets() or new_name in self.saved_presets):
+            messagebox.showerror("Strategy name already exists", "Choose a name that is not already in use.")
+            return
+        if new_name == old_name:
+            return
+        self.saved_presets[new_name] = self.saved_presets.pop(old_name)
+        self._refresh_preset_options()
+        self.preset_var.set(new_name)
+        self.save_training_settings(silent=True)
+        self.status.config(text=f"Renamed training strategy to: {new_name}.")
+
+    def delete_selected_preset(self):
+        """Delete a user-created strategy after confirmation; built-ins stay intact."""
+        name = self.preset_var.get().strip()
+        if name in self.builtin_presets():
+            messagebox.showinfo(
+                "Built-in strategy",
+                "Built-in training strategies cannot be deleted. Your saved custom strategies can be deleted here.",
+            )
+            return
+        if name not in self.saved_presets:
+            messagebox.showerror("Strategy not found", "Choose a saved training strategy to delete.")
+            return
+        if not messagebox.askyesno(
+            "Delete training strategy",
+            f'Delete the saved training strategy "{name}"? This cannot be undone.',
+            parent=self,
+        ):
+            return
+        del self.saved_presets[name]
+        self.preset_var.set("Default")
+        self._refresh_preset_options()
+        self.save_training_settings(silent=True)
+        self.status.config(text=f"Deleted training strategy: {name}.")
 
     def collect_training_settings(self):
         values = {}
         for key, variable in self._settings_variables().items():
             values[key] = variable.get()
         values["format"] = "roblox_action_flow_training_settings_v2"
+        values["selected_preset"] = self.preset_var.get()
+        values["saved_presets"] = self.saved_presets
         return values
 
     def apply_training_settings(self, settings):
@@ -2007,10 +2573,16 @@ class TrainTab(ttk.Frame):
 
     def load_training_settings(self):
         self._settings_loaded = False
+        self._refresh_preset_options()
         try:
             if TRAINING_SETTINGS_FILE.is_file():
                 settings = json.loads(TRAINING_SETTINGS_FILE.read_text(encoding="utf-8"))
+                saved = settings.get("saved_presets", {})
+                self.saved_presets = saved if isinstance(saved, dict) else {}
+                self._refresh_preset_options()
                 self.apply_training_settings(settings)
+                selected = str(settings.get("selected_preset", "Default"))
+                self.preset_var.set(selected if selected in self.preset_combo["values"] else "Default")
                 self.status.config(text=f"Restored autosaved settings from {TRAINING_SETTINGS_FILE.name}.")
         except Exception as exc:
             self.status.config(text=f"Could not restore saved settings: {exc}")
@@ -2032,6 +2604,7 @@ class TrainTab(ttk.Frame):
 
         for variable in self._settings_variables().values():
             variable.trace_add("write", changed)
+        self.preset_var.trace_add("write", changed)
 
     @staticmethod
     def _parse_settings_text(raw_text):
@@ -2110,18 +2683,18 @@ class TrainTab(ttk.Frame):
             messagebox.showerror("Could not export settings", str(exc))
 
     def browse_dataset(self):
-        value = filedialog.askdirectory(title="Select the recorder dataset folder")
-        if value:
-            self.dataset_var.set(value)
+        selected = native_dataset_folder_picker(self, "Select recorder dataset folders")
+        if selected:
+            self.dataset_var.set("; ".join(str(path) for path in selected))
 
     def add_dataset(self):
-        value = filedialog.askdirectory(title="Add another recorder dataset folder")
-        if not value:
+        added = native_dataset_folder_picker(self, "Add recorder dataset folders")
+        if not added:
             return
         selected = dataset_directories(self.dataset_var.get())
-        folder = Path(value)
-        if folder not in selected:
-            selected.append(folder)
+        for folder in added:
+            if folder not in selected:
+                selected.append(folder)
         self.dataset_var.set("; ".join(str(path) for path in selected))
 
     def check_dataset(self):
@@ -2231,6 +2804,9 @@ class TrainTab(ttk.Frame):
             directories = dataset_directories(dataset)
             if not directories or any(not directory.is_dir() for directory in directories):
                 raise ValueError("Select one or more recorded action dataset folders.")
+            if not self.include_older_data_var.get() and len(directories) > 1:
+                dataset = str(directories[0])
+                self.append("Older recording mixing is off; training will use the first selected dataset only.")
             frame_gap = int(self.frame_gap.get())
             action_aggregation = self.action_aggregation.get()
             report, pairs = inspect_action_dataset(dataset, frame_gap, action_aggregation)
@@ -2279,6 +2855,7 @@ class TrainTab(ttk.Frame):
                 "contrast_samples": max(2, int(self.contrast_samples.get())),
                 "chunk_size": int(self.chunk_size.get()),
                 "chunk_mode": self.chunk_mode.get().strip().lower(),
+                "replay_older_percent": max(0.0, float(self.replay_older_percent.get())),
                 "chunk_offset": int(self.chunk_offset.get()),
                 "chunk_seed": int(self.chunk_seed.get()),
                 "benchmark_batches": max(1, int(self.benchmark_batches.get())),
@@ -2320,6 +2897,7 @@ class TrainTab(ttk.Frame):
                 "--contrast-samples", str(values["contrast_samples"]),
                 "--chunk-size", str(values["chunk_size"]),
                 "--chunk-mode", str(values["chunk_mode"]),
+                "--replay-older-percent", str(values["replay_older_percent"]),
                 "--chunk-offset", str(values["chunk_offset"]),
                 "--chunk-seed", str(values["chunk_seed"]),
                 "--benchmark-batches", str(values["benchmark_batches"]),
@@ -2534,6 +3112,7 @@ class PlayerTab(ttk.Frame):
         self.worker = None
         self.frame_queue = queue.Queue(maxsize=2)
         self.ui_queue = queue.Queue(maxsize=16)
+        self.display_sequence_token = 0
         self.runtime_settings = {}
         self.keys = set()
         self.keyboard_listener = None
@@ -2550,6 +3129,8 @@ class PlayerTab(ttk.Frame):
         self.player_seed = random.randrange(1_000_000_000)
         self.motion_noise_refresh = DEFAULT_MOTION_NOISE_REFRESH
         self.active_noise_multiplier = DEFAULT_ACTIVE_NOISE_MULTIPLIER
+        self.frame_stability_var = tk.DoubleVar(value=25.0)
+        self.frame_stability_text = tk.StringVar(value="Motion-aware stability: 25%")
         self.motion_profile_summary = "Balanced movement profile"
         self.compare_photo = None
         self._last_settings_signature = None
@@ -2586,7 +3167,13 @@ class PlayerTab(ttk.Frame):
         self.model_box = ttk.Combobox(controls, textvariable=self.model_var, state="readonly", width=31)
         self.model_box.pack(fill="x", pady=3)
         self.model_box.bind("<<ComboboxSelected>>", self.on_model_selected)
+        ttk.Button(controls, text="Add Downloaded Action Model (.zip or folder)", command=self.add_model_package).pack(fill="x", pady=3)
         ttk.Button(controls, text="Refresh Models", command=self.refresh_models).pack(fill="x", pady=3)
+        ttk.Label(
+            controls,
+            text="1. Add the action model you downloaded.  2. Choose a screenshot from that game.  3. Start playing.",
+            style="Meta.TLabel", wraplength=250, justify="left",
+        ).pack(fill="x", pady=(4, 5))
 
         self.start_image_var = tk.StringVar()
         ttk.Label(controls, text="Starting image", style="Meta.TLabel").pack(anchor="w", pady=(8, 0))
@@ -2601,6 +3188,32 @@ class PlayerTab(ttk.Frame):
         self.guidance.pack(fill="x", pady=5)
         self.active_noise = Field(controls, "Active motion noise multiplier", str(DEFAULT_ACTIVE_NOISE_MULTIPLIER), ["0.25", "0.5", "0.75", "1.0"])
         self.active_noise.pack(fill="x", pady=5)
+        self.motion_subdivision = Field(controls, "Real motion subdivision", "3x", ["1x", "2x", "3x", "4x"])
+        self.motion_subdivision.pack(fill="x", pady=5)
+        ttk.Label(
+            controls,
+            text="3x spreads continuous movement across three times as many genuine AI frames, so it moves three times slower.",
+            style="Meta.TLabel",
+            wraplength=250,
+            justify="left",
+        ).pack(fill="x", pady=(0, 3))
+        self.display_multiplier = Field(controls, "Synthetic display interpolation", "1x", ["1x", "2x", "3x", "4x"])
+        self.display_multiplier.pack(fill="x", pady=5)
+        ttk.Label(controls, textvariable=self.frame_stability_text, style="Meta.TLabel").pack(anchor="w", pady=(7, 0))
+        ttk.Scale(
+            controls,
+            variable=self.frame_stability_var,
+            from_=0.0,
+            to=100.0,
+            command=self.update_frame_stability_label,
+        ).pack(fill="x", pady=(2, 1))
+        ttk.Label(
+            controls,
+            text="Aligns the last frame to current motion, then preserves only matching regions. 0 shows the raw model frame.",
+            style="Meta.TLabel",
+            wraplength=250,
+            justify="left",
+        ).pack(fill="x", pady=(0, 4))
         self.require_right_mouse_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(
             controls,
@@ -2623,7 +3236,8 @@ class PlayerTab(ttk.Frame):
                 "Use W/A/S/D or the arrow keys, plus Space. Idle holds the current frame; an active control shows the "
                 "model's raw, action-guided next frame. Right-drag controls degree-calibrated yaw/pitch; the wheel "
                 "controls zoom. A reference video can calibrate movement frequency, but not teach missing controls. "
-                "No display smoothing, anchors, or RGB blending are applied."
+                "Motion-aware stability aligns the preceding view and rejects changed or newly exposed regions. "
+                "It is still short-range stabilization, not persistent world memory."
             ),
             style="Meta.TLabel",
             wraplength=250,
@@ -2658,6 +3272,31 @@ class PlayerTab(ttk.Frame):
         self.model_box["values"] = list(self.models)
         if paths and self.model_var.get() not in self.models:
             self.model_var.set(paths[0].name)
+
+    def add_model_package(self):
+        """Import a release package without making viewers manually unpack it."""
+        selected = filedialog.askopenfilename(
+            title="Choose an Action Flow model ZIP, or cancel to choose its folder",
+            filetypes=[("Action model package", "*.zip"), ("All files", "*.*")],
+        )
+        if not selected:
+            selected = filedialog.askdirectory(title="Choose the Action Flow model folder")
+        if not selected:
+            return
+        try:
+            self.status.config(text="Adding action model package. This can take a moment...")
+            self.update_idletasks()
+            imported = import_action_model_package(selected)
+            self.refresh_models()
+            self.model_var.set(imported.name)
+            self.on_model_selected()
+            self.status.config(text=f"Action model ready: {imported.name}. Now choose a starting image.")
+        except Exception as exc:
+            messagebox.showerror("Could not add action model", str(exc))
+
+    def update_frame_stability_label(self, value=None):
+        amount = self.frame_stability_var.get() if value is None else float(value)
+        self.frame_stability_text.set(f"Motion-aware stability: {round(amount):d}%")
 
     def model_stamp(self, key):
         """Identify the actual checkpoint, including models overwritten in the same folder."""
@@ -2739,6 +3378,9 @@ class PlayerTab(ttk.Frame):
         signature = (
             self.model_var.get(), int(self.steps.get()), self.method.get(),
             float(self.guidance.get()), float(self.active_noise.get()),
+            round(float(self.frame_stability_var.get()), 1),
+            self.motion_subdivision.get(),
+            self.display_multiplier.get(),
         )
         if emit_console and signature != self._last_settings_signature:
             print("\n--- Direct Action-Guided Player ---", flush=True)
@@ -2747,6 +3389,9 @@ class PlayerTab(ttk.Frame):
             print(f"Trained action scale: {trained_scale:.3f}", flush=True)
             print(f"Action guidance: {float(self.guidance.get()):.2f}", flush=True)
             print(f"Active motion noise multiplier: {float(self.active_noise.get()):.2f}", flush=True)
+            print(f"Motion-aware stability: {float(self.frame_stability_var.get()):.0f}%", flush=True)
+            print(f"Real motion subdivision: {self.motion_subdivision.get()}", flush=True)
+            print(f"Display frame multiplier: {self.display_multiplier.get()}", flush=True)
             print(f"Flow steps / denoise method: {int(self.steps.get())} / {self.method.get()}", flush=True)
             print("Idle is frozen; generated frames are displayed raw.\n", flush=True)
             self._last_settings_signature = signature
@@ -2919,6 +3564,9 @@ class PlayerTab(ttk.Frame):
             "action_input_scale": action_scale,
             "motion_noise_refresh": self.motion_noise_refresh,
             "active_noise_multiplier": max(0.0, min(1.0, float(self.active_noise.get()))),
+            "frame_stability": max(0.0, min(1.0, float(self.frame_stability_var.get()) / 100.0)),
+            "motion_subdivision": max(1, min(4, int(str(self.motion_subdivision.get()).rstrip("xX")))),
+            "display_multiplier": max(1, min(4, int(str(self.display_multiplier.get()).rstrip("xX")))),
             "guidance": max(0.0, float(self.guidance.get())),
             "camera_encoding": str(info.get("camera_encoding", "legacy_pixels")),
             "yaw_counts_per_360_degrees": float(info.get("yaw_counts_per_360_degrees") or 2400.0),
@@ -3069,12 +3717,14 @@ class PlayerTab(ttk.Frame):
             while self.running and run_id == self.run_id:
                 started = time.perf_counter()
                 settings = dict(self.runtime_settings)
+                previous_frame = self.current_frame
                 previous = source.pil_to_normalized_tensor(self.current_frame, self.device, self.dtype)
                 action_values, moving = self.action_snapshot(settings, reset_mouse=True)
                 input_text = (
                     "Guided input: " + (" + ".join([name.upper() for name, value in zip(ACTION_NAMES[:5], action_values[:5]) if value > 0.5]) or "IDLE")
                     + f"  |  yaw {action_values[5]:+.2f}  pitch {action_values[6]:+.2f}  zoom {action_values[7]:+.2f}"
                     + f"  |  guidance {settings['guidance']:.1f}x"
+                    + f"  |  real motion 1/{settings['motion_subdivision']}"
                     + f"  |  motion {settings['motion_noise_refresh'] * settings['active_noise_multiplier']:.3f}"
                 )
 
@@ -3084,9 +3734,15 @@ class PlayerTab(ttk.Frame):
                 else:
                     # Persistent same-noise inference makes action differences visible;
                     # only the previous frame and pressed control change between steps.
-                    active_refresh = settings["motion_noise_refresh"] * settings["active_noise_multiplier"]
+                    subdivisions = settings["motion_subdivision"]
+                    active_refresh = (
+                        settings["motion_noise_refresh"] *
+                        settings["active_noise_multiplier"] /
+                        subdivisions
+                    )
                     initial_noise = self.blend_noise(previous.shape, active_refresh, generator)
-                    action = torch.tensor([action_values], device=self.device, dtype=self.dtype)
+                    model_action_values = subdivide_action_values(action_values, subdivisions)
+                    action = torch.tensor([model_action_values], device=self.device, dtype=self.dtype)
                     generated = sample_guided_action_frame(
                         self.loaded_model,
                         previous,
@@ -3101,15 +3757,40 @@ class PlayerTab(ttk.Frame):
                         guidance=settings["guidance"],
                     )
                     model_result = source.tensor_to_pil(generated[0])
+                    try:
+                        model_result = motion_aware_stabilize(
+                            self.current_frame,
+                            model_result,
+                            settings["frame_stability"],
+                        )
+                    except Exception:
+                        # Stabilization is optional; never interrupt action inference
+                        # if optical flow cannot resolve a particular frame.
+                        pass
 
                 self.current_frame = model_result
                 self.display_frame = model_result.copy()
                 self.frame_index += 1
+                try:
+                    display_frames = interpolate_motion_frames(
+                        previous_frame,
+                        self.display_frame,
+                        settings["display_multiplier"] if moving else 1,
+                    )
+                except Exception:
+                    display_frames = [self.display_frame.copy()]
                 elapsed = max(1e-6, time.perf_counter() - started)
                 try:
                     while self.frame_queue.qsize() > 0:
                         self.frame_queue.get_nowait()
-                    self.frame_queue.put_nowait((self.display_frame.copy(), 1.0 / elapsed, input_text, "Direct guided"))
+                    display_mode = f"Motion-aware stability {settings['frame_stability'] * 100:.0f}%"
+                    self.frame_queue.put_nowait((
+                        display_frames,
+                        1.0 / elapsed,
+                        input_text,
+                        display_mode,
+                        elapsed / max(1, len(display_frames)),
+                    ))
                 except queue.Full:
                     pass
         except Exception:
@@ -3242,13 +3923,30 @@ class PlayerTab(ttk.Frame):
             pass
         try:
             while True:
-                frame, fps, input_text, mode = self.frame_queue.get_nowait()
-                self.show_frame(frame)
+                frames, fps, input_text, mode, frame_interval = self.frame_queue.get_nowait()
+                self.play_display_sequence(frames, frame_interval)
                 self.input_var.set(input_text)
-                self.fps_var.set(f"AI FPS: {fps:.2f}  |  Display: {mode}")
+                self.fps_var.set(
+                    f"AI FPS: {fps:.2f}  |  Display FPS: ~{fps * len(frames):.1f}  |  {mode}"
+                )
         except queue.Empty:
             pass
         self.after(30, self.poll_frames)
+
+    def play_display_sequence(self, frames, frame_interval):
+        """Display in-betweens while the worker generates the next real AI frame."""
+        if not frames:
+            return
+        self.display_sequence_token += 1
+        token = self.display_sequence_token
+        delay_ms = max(1, round(float(frame_interval) * 1000.0))
+
+        def show_if_current(frame):
+            if token == self.display_sequence_token:
+                self.show_frame(frame)
+
+        for index, frame in enumerate(frames):
+            self.after(index * delay_ms, show_if_current, frame)
 
     def show_frame(self, frame):
         if frame is None:
@@ -3281,7 +3979,7 @@ class PlayerTab(ttk.Frame):
 class App:
     def __init__(self, root):
         self.root = root
-        self.root.title("Game Action Flow Trainer + Controls")
+        self.root.title("Game Oasis Player")
         self.root.geometry("1180x820")
         self.root.minsize(960, 680)
         self.root.configure(bg=BG)
@@ -3292,7 +3990,8 @@ class App:
         self.train_tab = TrainTab(notebook, self)
         self.player_tab = PlayerTab(notebook, self)
         notebook.add(self.train_tab, text="Action Training")
-        notebook.add(self.player_tab, text="Action Player")
+        notebook.add(self.player_tab, text="Game Oasis Player")
+        notebook.select(self.player_tab)
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
     def on_close(self):
@@ -3357,6 +4056,7 @@ def parse_args():
     parser.add_argument("--contrast-samples", type=int, default=2)
     parser.add_argument("--chunk-size", type=int, default=0)
     parser.add_argument("--chunk-mode", choices=["balanced", "random", "sequential"], default="balanced")
+    parser.add_argument("--replay-older-percent", type=float, default=50.0)
     parser.add_argument("--chunk-offset", type=int, default=0)
     parser.add_argument("--chunk-seed", type=int, default=1234)
     parser.add_argument("--benchmark-only", action="store_true")
