@@ -307,7 +307,10 @@ class RobloxActionRecorder:
         self.root.minsize(1020, 840)
         self.root.configure(bg=APP_BG)
 
-        self.output_dir = Path.cwd() / "roblox_action_dataset"
+        # Use the recorder's own folder instead of the process working directory.
+        # Windows can launch a script with C:\Windows\System32 as its working
+        # directory, which is not writable for normal users.
+        self.output_dir = APP_DIR / "roblox_action_dataset"
         self.capture_region = None
         self.capture_presets = self._load_capture_presets()
         self.recording = False
@@ -336,6 +339,12 @@ class RobloxActionRecorder:
         self.start_time = 0.0
         self.preview_photo = None
         self.last_preview = None
+        self.automation_running = False
+        self.automation_paused = False
+        self.automation_skip_requested = False
+        self.automation_thread = None
+        self.input_controller = keyboard.Controller() if keyboard is not None else None
+        self.automation_pressed_keys = set()
 
         self._style()
         self._build()
@@ -363,6 +372,9 @@ class RobloxActionRecorder:
         style.configure("Accent.TButton", background=ACCENT, foreground="#10131a", font=("Segoe UI", 10, "bold"))
         style.configure("TCheckbutton", background=PANEL, foreground=FG)
         style.configure("TCombobox", fieldbackground=FIELD, foreground=FG)
+        style.configure("TNotebook", background=APP_BG, borderwidth=0)
+        style.configure("TNotebook.Tab", background=FIELD, foreground=DIM, padding=(16, 8))
+        style.map("TNotebook.Tab", background=[("selected", PANEL)], foreground=[("selected", FG)])
 
     def _build(self):
         outer = ttk.Frame(self.root, style="Panel.TFrame", padding=16)
@@ -380,7 +392,14 @@ class RobloxActionRecorder:
             style="Body.TLabel"
         ).pack(anchor="w", pady=(2, 12))
 
-        body = ttk.Frame(outer, style="Panel.TFrame")
+        self.tabs = ttk.Notebook(outer)
+        self.tabs.pack(fill="both", expand=True)
+        manual_tab = ttk.Frame(self.tabs, style="Panel.TFrame", padding=(0, 12, 0, 0))
+        automate_tab = ttk.Frame(self.tabs, style="Panel.TFrame", padding=(0, 12, 0, 0))
+        self.tabs.add(manual_tab, text="Manual dataset")
+        self.tabs.add(automate_tab, text="Automate dataset")
+
+        body = ttk.Frame(manual_tab, style="Panel.TFrame")
         body.pack(fill="both", expand=True)
         body.columnconfigure(1, weight=1)
         body.rowconfigure(0, weight=1)
@@ -562,6 +581,111 @@ class RobloxActionRecorder:
         ).grid(row=3, column=0, sticky="ew", pady=(5, 0))
 
         # F8 stops recording and F7 finishes camera calibration, including while hidden.
+        self._build_automation_tab(automate_tab)
+
+    def _build_automation_tab(self, parent):
+        card = ttk.Frame(parent, style="Card.TFrame", padding=18)
+        card.pack(fill="both", expand=True)
+
+        ttk.Label(card, text="Automated movement sequence", style="CardHeading.TLabel").pack(anchor="w")
+        ttk.Label(
+            card,
+            text=(
+                "Records each important movement direction for an exact number of captured frames. "
+                "The automation releases all keys whenever it pauses, stops, or detects a safety problem."
+            ),
+            style="Meta.TLabel", wraplength=850, justify="left",
+        ).pack(anchor="w", pady=(4, 14))
+
+        settings = ttk.Frame(card, style="Card.TFrame")
+        settings.pack(fill="x")
+
+        self.automation_frames_var = tk.IntVar(value=60)
+        ttk.Label(settings, text="Frames per movement", style="Meta.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Spinbox(
+            settings, from_=1, to=10000, textvariable=self.automation_frames_var, width=12
+        ).grid(row=1, column=0, sticky="ew", padx=(0, 12), pady=(3, 10))
+
+        self.automation_gap_var = tk.IntVar(value=12)
+        ttk.Label(settings, text="Idle frames between movements", style="Meta.TLabel").grid(row=0, column=1, sticky="w")
+        ttk.Spinbox(
+            settings, from_=0, to=1000, textvariable=self.automation_gap_var, width=12
+        ).grid(row=1, column=1, sticky="ew", padx=(0, 12), pady=(3, 10))
+
+        self.automation_cycles_var = tk.IntVar(value=1)
+        ttk.Label(settings, text="Sequence repeats", style="Meta.TLabel").grid(row=0, column=2, sticky="w")
+        ttk.Spinbox(
+            settings, from_=1, to=100, textvariable=self.automation_cycles_var, width=12
+        ).grid(row=1, column=2, sticky="ew", pady=(3, 10))
+
+        self.automation_idle_var = tk.BooleanVar(value=True)
+        self.automation_jump_var = tk.BooleanVar(value=False)
+        self.automation_focus_guard_var = tk.BooleanVar(value=True)
+        self.automation_mouse_guard_var = tk.BooleanVar(value=True)
+        self.automation_stop_on_safety_var = tk.BooleanVar(value=False)
+        self.automation_auto_record_var = tk.BooleanVar(value=True)
+
+        ttk.Checkbutton(
+            card, text="Include a no-input (IDLE) sample", variable=self.automation_idle_var
+        ).pack(anchor="w", pady=2)
+        ttk.Checkbutton(
+            card, text="Also record each movement while jumping", variable=self.automation_jump_var
+        ).pack(anchor="w", pady=2)
+        ttk.Checkbutton(
+            card, text="Start and stop the dataset recording automatically", variable=self.automation_auto_record_var
+        ).pack(anchor="w", pady=2)
+
+        ttk.Label(card, text="Safety barriers", style="CardHeading.TLabel").pack(anchor="w", pady=(16, 6))
+        ttk.Checkbutton(
+            card,
+            text="Pause if Roblox is not the active window",
+            variable=self.automation_focus_guard_var,
+        ).pack(anchor="w", pady=2)
+        ttk.Checkbutton(
+            card,
+            text="Pause if the mouse leaves the capture region (20 px safety inset)",
+            variable=self.automation_mouse_guard_var,
+        ).pack(anchor="w", pady=2)
+        ttk.Checkbutton(
+            card,
+            text="Stop the whole run instead of pausing after a safety trigger",
+            variable=self.automation_stop_on_safety_var,
+        ).pack(anchor="w", pady=2)
+
+        ttk.Label(
+            card,
+            text="Sequence: W → WD → D → DS → S → SA → A → AW",
+            style="Value.TLabel",
+        ).pack(anchor="w", pady=(16, 4))
+        ttk.Label(
+            card,
+            text="Hotkeys: F6 pause/resume • F9 skip current movement • F10 emergency stop • F8 stops recording",
+            style="Meta.TLabel",
+        ).pack(anchor="w", pady=(0, 12))
+
+        buttons = ttk.Frame(card, style="Card.TFrame")
+        buttons.pack(fill="x")
+        self.automation_start_btn = ttk.Button(
+            buttons, text="Start Automated Dataset", command=self.start_automation, style="Accent.TButton"
+        )
+        self.automation_start_btn.pack(side="left", fill="x", expand=True, padx=(0, 5))
+        self.automation_pause_btn = ttk.Button(
+            buttons, text="Pause", command=self.toggle_automation_pause, state="disabled"
+        )
+        self.automation_pause_btn.pack(side="left", fill="x", expand=True, padx=5)
+        self.automation_skip_btn = ttk.Button(
+            buttons, text="Next Input", command=self.skip_automation_action, state="disabled"
+        )
+        self.automation_skip_btn.pack(side="left", fill="x", expand=True, padx=5)
+        self.automation_stop_btn = ttk.Button(
+            buttons, text="Emergency Stop", command=self.stop_automation, state="disabled"
+        )
+        self.automation_stop_btn.pack(side="left", fill="x", expand=True, padx=(5, 0))
+
+        self.automation_status_var = tk.StringVar(value="Ready")
+        ttk.Label(
+            card, textvariable=self.automation_status_var, style="Value.TLabel"
+        ).pack(anchor="w", pady=(14, 0))
 
     def _start_keyboard_listener(self):
         if keyboard is None:
@@ -573,10 +697,19 @@ class RobloxActionRecorder:
 
         def on_press(key):
             if key == keyboard.Key.f8:
-                self.root.after(0, self.toggle_recording)
+                self.root.after(0, self._handle_f8)
                 return
             if key == keyboard.Key.f7:
                 self.root.after(0, self.finish_camera_calibration)
+                return
+            if key == keyboard.Key.f6:
+                self.root.after(0, self.toggle_automation_pause)
+                return
+            if key == keyboard.Key.f9:
+                self.root.after(0, self.skip_automation_action)
+                return
+            if key == keyboard.Key.f10:
+                self.root.after(0, self.stop_automation)
                 return
 
             with self.action_lock:
@@ -619,6 +752,12 @@ class RobloxActionRecorder:
         self.keyboard_listener = keyboard.Listener(on_press=on_press, on_release=on_release)
         self.keyboard_listener.daemon = True
         self.keyboard_listener.start()
+
+    def _handle_f8(self):
+        if self.automation_running:
+            self.stop_automation()
+        if self.recording:
+            self.stop_recording()
 
     def _start_mouse_listener(self):
         if mouse is None:
@@ -844,6 +983,255 @@ class RobloxActionRecorder:
             self.stop_recording()
         else:
             self.start_recording()
+
+    def _automation_sequence(self):
+        sequence = [
+            ("W", ("w",)), ("WD", ("w", "d")), ("D", ("d",)), ("DS", ("d", "s")),
+            ("S", ("s",)), ("SA", ("s", "a")), ("A", ("a",)), ("AW", ("a", "w")),
+        ]
+        if self.automation_idle_var.get():
+            sequence.insert(0, ("IDLE", ()))
+        if self.automation_jump_var.get():
+            sequence += [(f"{name}+JUMP", keys + ("space",)) for name, keys in sequence if keys]
+        return sequence
+
+    def _set_automation_buttons(self, running):
+        self.automation_start_btn.config(state="disabled" if running else "normal")
+        state = "normal" if running else "disabled"
+        self.automation_pause_btn.config(state=state, text="Resume" if self.automation_paused else "Pause")
+        self.automation_skip_btn.config(state=state)
+        self.automation_stop_btn.config(state=state)
+
+    def start_automation(self):
+        if self.automation_running:
+            return
+        if keyboard is None or self.input_controller is None:
+            messagebox.showerror("Missing dependency", "Automated input requires pynput.")
+            return
+        if self.capture_region is None:
+            messagebox.showwarning("No capture region", "Select the Roblox game region in Manual dataset first.")
+            self.tabs.select(0)
+            return
+        try:
+            frames_per_action = int(self.automation_frames_var.get())
+            gap_frames = int(self.automation_gap_var.get())
+            cycles = int(self.automation_cycles_var.get())
+        except (ValueError, tk.TclError):
+            messagebox.showerror("Invalid automation settings", "Frame counts and repeats must be whole numbers.")
+            return
+        if frames_per_action < 1 or gap_frames < 0 or cycles < 1:
+            messagebox.showerror("Invalid automation settings", "Use at least 1 frame and 1 repeat.")
+            return
+
+        self.automation_running = True
+        self.automation_paused = False
+        self.automation_skip_requested = False
+        self._set_automation_buttons(True)
+        self.automation_status_var.set("Preparing automation...")
+
+        if self.automation_auto_record_var.get() and not self.recording:
+            self.start_recording()
+            if not self.recording:
+                self.automation_running = False
+                self._set_automation_buttons(False)
+                return
+
+        sequence = self._automation_sequence()
+        delay = float(self.start_delay_var.get()) if self.automation_auto_record_var.get() else 0.0
+        self.automation_thread = threading.Thread(
+            target=self._automation_loop,
+            args=(sequence, frames_per_action, gap_frames, cycles, delay),
+            daemon=True,
+        )
+        self.automation_thread.start()
+
+    def _roblox_is_foreground(self):
+        if os.name != "nt":
+            return True
+        try:
+            import ctypes
+            hwnd = ctypes.windll.user32.GetForegroundWindow()
+            length = ctypes.windll.user32.GetWindowTextLengthW(hwnd)
+            title = ctypes.create_unicode_buffer(length + 1)
+            ctypes.windll.user32.GetWindowTextW(hwnd, title, length + 1)
+            return "roblox" in title.value.lower()
+        except Exception:
+            return False
+
+    def _mouse_inside_safe_region(self):
+        if mouse is None or self.capture_region is None:
+            return True
+        try:
+            x, y = mouse.Controller().position
+            region = self.capture_region
+            inset = 20
+            return (
+                region["left"] + inset <= x < region["left"] + region["width"] - inset
+                and region["top"] + inset <= y < region["top"] + region["height"] - inset
+            )
+        except Exception:
+            return False
+
+    def _automation_safety_issue(self):
+        if self.automation_focus_guard_var.get() and not self._roblox_is_foreground():
+            return "Roblox is not the active window"
+        if self.automation_mouse_guard_var.get() and not self._mouse_inside_safe_region():
+            return "Mouse left the safe capture area"
+        return None
+
+    def _release_automation_keys(self):
+        if self.input_controller is None:
+            return
+        for key in list(self.automation_pressed_keys):
+            try:
+                self.input_controller.release(key)
+            except Exception:
+                pass
+        self.automation_pressed_keys.clear()
+
+    def _press_automation_keys(self, names):
+        key_map = {
+            "w": "w", "a": "a", "s": "s", "d": "d",
+            "space": keyboard.Key.space,
+        }
+        for name in names:
+            key = key_map[name]
+            self.input_controller.press(key)
+            self.automation_pressed_keys.add(key)
+
+    def _wait_automation_frames(self, frame_count, resume_keys=()):
+        if frame_count <= 0:
+            return True
+        start_frame = self.session_frame_count
+        fallback_fps = max(1, int(self.fps_var.get()))
+        fallback_end = time.perf_counter() + (frame_count / fallback_fps)
+        was_paused = False
+        while self.automation_running:
+            issue = self._automation_safety_issue()
+            if issue:
+                self._release_automation_keys()
+                if self.automation_stop_on_safety_var.get():
+                    self.root.after(0, lambda reason=issue: self.automation_status_var.set(f"Stopped: {reason}"))
+                    self.automation_running = False
+                    return False
+                self.automation_paused = True
+                was_paused = True
+                self.root.after(0, lambda reason=issue: self.automation_status_var.set(f"Safety pause: {reason}"))
+                self.root.after(0, lambda: self.automation_pause_btn.config(text="Resume"))
+
+            if self.automation_skip_requested:
+                self.automation_skip_requested = False
+                return False
+            if self.automation_paused:
+                was_paused = True
+                time.sleep(0.03)
+                continue
+            if was_paused:
+                self._press_automation_keys(resume_keys)
+                start_frame = self.session_frame_count
+                fallback_end = time.perf_counter() + (frame_count / fallback_fps)
+                was_paused = False
+            if self.recording:
+                if self.session_frame_count - start_frame >= frame_count:
+                    return True
+            elif time.perf_counter() >= fallback_end:
+                return True
+            time.sleep(0.005)
+        return False
+
+    def _automation_loop(self, sequence, frames_per_action, gap_frames, cycles, delay):
+        try:
+            if delay > 0:
+                end = time.perf_counter() + delay
+                while self.automation_running and time.perf_counter() < end:
+                    remaining = max(0.0, end - time.perf_counter())
+                    self.root.after(
+                        0, lambda value=remaining: self.automation_status_var.set(
+                            f"Starting in {value:.1f}s — focus Roblox and place the mouse safely"
+                        )
+                    )
+                    time.sleep(0.05)
+
+            total = len(sequence) * cycles
+            number = 0
+            for cycle in range(cycles):
+                for name, keys in sequence:
+                    if not self.automation_running:
+                        break
+                    number += 1
+                    self._release_automation_keys()
+                    while self.automation_running:
+                        issue = self._automation_safety_issue()
+                        if issue:
+                            if self.automation_stop_on_safety_var.get():
+                                self.automation_running = False
+                                break
+                            self.automation_paused = True
+                            self.root.after(
+                                0, lambda reason=issue: self.automation_status_var.set(f"Safety pause: {reason}")
+                            )
+                            self.root.after(0, lambda: self.automation_pause_btn.config(text="Resume"))
+                        if not self.automation_paused and not issue:
+                            break
+                        time.sleep(0.03)
+                    if not self.automation_running:
+                        break
+
+                    self._press_automation_keys(keys)
+                    self.root.after(
+                        0, lambda label=name, n=number, count=total:
+                        self.automation_status_var.set(f"Input {n}/{count}: {label}")
+                    )
+                    self._wait_automation_frames(frames_per_action, keys)
+                    self._release_automation_keys()
+                    if not self.automation_running:
+                        break
+                    if gap_frames:
+                        self.root.after(0, lambda: self.automation_status_var.set("Neutral gap"))
+                        self._wait_automation_frames(gap_frames)
+                if not self.automation_running:
+                    break
+        except Exception:
+            error = traceback.format_exc()
+            self.root.after(0, lambda: messagebox.showerror("Automation error", error[-2400:]))
+        finally:
+            self._release_automation_keys()
+            completed = self.automation_running
+            self.automation_running = False
+            self.automation_paused = False
+            if self.automation_auto_record_var.get() and self.recording:
+                self.root.after(0, self.stop_recording)
+            self.root.after(0, lambda: self._set_automation_buttons(False))
+            if completed:
+                self.root.after(0, lambda: self.automation_status_var.set("Sequence complete"))
+            self.root.after(0, self._show_recorder)
+
+    def toggle_automation_pause(self):
+        if not self.automation_running:
+            return
+        self.automation_paused = not self.automation_paused
+        if self.automation_paused:
+            self._release_automation_keys()
+            self.automation_status_var.set("Paused — all automated keys released")
+            self.automation_pause_btn.config(text="Resume")
+        else:
+            self.automation_status_var.set("Resuming...")
+            self.automation_pause_btn.config(text="Pause")
+
+    def skip_automation_action(self):
+        if self.automation_running:
+            self._release_automation_keys()
+            self.automation_skip_requested = True
+            self.automation_status_var.set("Skipping to next input...")
+
+    def stop_automation(self):
+        if not self.automation_running:
+            return
+        self.automation_running = False
+        self.automation_paused = False
+        self._release_automation_keys()
+        self.automation_status_var.set("Emergency stop — all automated keys released")
+        self._set_automation_buttons(False)
 
     def start_recording(self):
         if self.calibrating_camera:
@@ -1188,6 +1576,8 @@ class RobloxActionRecorder:
             messagebox.showinfo("Dataset folder", str(root))
 
     def close(self):
+        self.automation_running = False
+        self._release_automation_keys()
         self.recording = False
         if self.keyboard_listener is not None:
             try:
