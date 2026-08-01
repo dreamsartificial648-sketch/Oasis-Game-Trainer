@@ -34,18 +34,26 @@ FIELD = "#2b2f39"
 FG = "#eef1f7"
 DIM = "#aab0be"
 ACCENT = "#6f98ff"
-ACTION_NAMES = ["w", "a", "s", "d", "jump", "mouse_dx", "mouse_dy", "zoom"]
+EXTRA_BINARY_ACTIONS = [
+    "arrow_up", "arrow_left", "arrow_down", "arrow_right",
+    "enter", "shift", "ctrl", "alt", "tab", "escape",
+    "q", "e", "r", "f", "z", "x", "c", "v",
+    "key_1", "key_2", "key_3", "key_4",
+    "mouse_left", "mouse_middle", "mouse_right",
+]
+BINARY_ACTION_NAMES = ["w", "a", "s", "d", "jump", *EXTRA_BINARY_ACTIONS]
+CONTINUOUS_ACTION_NAMES = ["mouse_dx", "mouse_dy", "zoom"]
+ACTION_NAMES = BINARY_ACTION_NAMES + CONTINUOUS_ACTION_NAMES
 ACTION_DIM = len(ACTION_NAMES)
-BINARY_ACTION_NAMES = ACTION_NAMES[:5]
 ACTION_DISPLAY_NAMES = {
     "w": "Up", "a": "Left", "s": "Down", "d": "Right", "jump": "Jump",
     "mouse_dx": "Camera Yaw", "mouse_dy": "Camera Pitch", "zoom": "Zoom",
+    "arrow_up": "Up Arrow", "arrow_left": "Left Arrow", "arrow_down": "Down Arrow", "arrow_right": "Right Arrow",
+    "mouse_left": "Left Click", "mouse_middle": "Middle Click", "mouse_right": "Right Click",
 }
 KEY_TO_ACTION = {
-    "w": "w", "up": "w",
-    "a": "a", "left": "a",
-    "s": "s", "down": "s",
-    "d": "d", "right": "d",
+    "w": "w", "up": "arrow_up", "a": "a", "left": "arrow_left",
+    "s": "s", "down": "arrow_down", "d": "d", "right": "arrow_right",
     "space": "space",
 }
 PLAYER_ACTION_GUIDANCE = 2.0
@@ -155,7 +163,7 @@ def system_telemetry(device=None):
 
 def action_is_idle(action):
     return all(
-        abs(float(value)) <= (0.5 if index < 5 else 0.02)
+        abs(float(value)) <= (0.5 if index < len(BINARY_ACTION_NAMES) else 0.02)
         for index, value in enumerate(action)
     )
 
@@ -575,20 +583,22 @@ def load_action_unet(model_dir, device=None, dtype=None):
         kwargs["torch_dtype"] = dtype
     model = UNet2DModel.from_pretrained(str(model_dir), subfolder="unet", **kwargs)
     channels = int(model.config.in_channels)
-    if channels == 11 and ACTION_DIM == 8:
-        # Upgrade an older five-action checkpoint while preserving its learned weights.
+    if channels in {11, 14} and channels != 6 + ACTION_DIM:
+        # Upgrade legacy 5/8-action checkpoints while preserving learned channels.
         import torch
         import torch.nn as nn
         old = model.conv_in
-        expanded = nn.Conv2d(14, old.out_channels, old.kernel_size, old.stride, old.padding, bias=old.bias is not None).to(old.weight)
+        expanded = nn.Conv2d(6 + ACTION_DIM, old.out_channels, old.kernel_size, old.stride, old.padding, bias=old.bias is not None).to(old.weight)
         with torch.no_grad():
             expanded.weight.zero_()
-            expanded.weight[:, :11].copy_(old.weight)
-            nn.init.normal_(expanded.weight[:, 11:], mean=0.0, std=0.002)
+            expanded.weight[:, :11].copy_(old.weight[:, :11])
+            if channels == 14:
+                analog_start = 6 + len(BINARY_ACTION_NAMES)
+                expanded.weight[:, analog_start:analog_start + 3].copy_(old.weight[:, 11:14])
             if old.bias is not None:
                 expanded.bias.copy_(old.bias)
         model.conv_in = expanded
-        model.register_to_config(in_channels=14)
+        model.register_to_config(in_channels=6 + ACTION_DIM)
     elif channels != 6 + ACTION_DIM:
         raise ValueError("The selected checkpoint is not a compatible action-conditioned video model.")
     if device is not None:
@@ -617,7 +627,7 @@ def aggregate_action_window(window_rows, method="window"):
 
     # Default: preserve short presses, but never create impossible opposing controls
     # merely because the player changed direction inside the temporal window.
-    binary = [max(vector[i] for vector in vectors) for i in range(5)]
+    binary = [max(vector[i] for vector in vectors) for i in range(len(BINARY_ACTION_NAMES))]
     for first, second in ((0, 2), (1, 3)):
         first_total = sum(vector[first] for vector in vectors)
         second_total = sum(vector[second] for vector in vectors)
@@ -643,11 +653,11 @@ def aggregate_action_window(window_rows, method="window"):
         # three-frame turn appear three times weaker than it really was.
         analog = [
             max(-1.0, min(1.0, sum(vector[i] for vector in vectors)))
-            for i in range(5, ACTION_DIM)
+            for i in range(len(BINARY_ACTION_NAMES), ACTION_DIM)
         ]
     else:
         # Legacy pixel-normalized datasets retain their original aggregation.
-        analog = [sum(vector[i] for vector in vectors) / len(vectors) for i in range(5, ACTION_DIM)]
+        analog = [sum(vector[i] for vector in vectors) / len(vectors) for i in range(len(BINARY_ACTION_NAMES), ACTION_DIM)]
     return binary + analog
 
 
@@ -665,7 +675,7 @@ def recommended_frame_gap(capture_fps, target_seconds=0.25):
 def observed_action_profiles(pairs):
     """Describe only controls and binary combinations genuinely present in a dataset."""
     counts = {
-        name: sum(abs(float(action[i])) > (0.5 if i < 5 else 0.02)
+        name: sum(abs(float(action[i])) > (0.5 if i < len(BINARY_ACTION_NAMES) else 0.02)
                   for _previous, _target, action in pairs)
         for i, name in enumerate(ACTION_NAMES)
     }
@@ -676,16 +686,16 @@ def observed_action_profiles(pairs):
     }
     binary_vectors = sorted({
         tuple(1.0 if i in enabled_binary_indexes and float(action[i]) > 0.5 else 0.0
-              for i in range(5))
+        for i in range(len(BINARY_ACTION_NAMES)))
         for _previous, _target, action in pairs
     })
-    if (0.0,) * 5 not in binary_vectors:
-        binary_vectors.insert(0, (0.0,) * 5)
+    if (0.0,) * len(BINARY_ACTION_NAMES) not in binary_vectors:
+        binary_vectors.insert(0, (0.0,) * len(BINARY_ACTION_NAMES))
     enabled_indexes = {index for index, name in enumerate(ACTION_NAMES) if name in enabled}
     full_profiles = sorted({
         tuple(
             (
-                (1.0 if float(action[i]) > 0.5 else 0.0) if i < 5
+                (1.0 if float(action[i]) > 0.5 else 0.0) if i < len(BINARY_ACTION_NAMES)
                 else (0.5 if float(action[i]) > 0.02 else -0.5 if float(action[i]) < -0.02 else 0.0)
             ) if i in enabled_indexes else 0.0
             for i in range(ACTION_DIM)
@@ -711,11 +721,11 @@ def counterfactual_actions(actions, observed_action_prototypes):
     if prototypes.shape[0] < 2:
         raise ValueError("Counterfactual training needs at least two distinct observed action profiles.")
     current = torch.cat([
-        (actions[:, :5] > 0.5).to(dtype=actions.dtype),
+        (actions[:, :len(BINARY_ACTION_NAMES)] > 0.5).to(dtype=actions.dtype),
         torch.where(
-            actions[:, 5:] > 0.02,
-            torch.full_like(actions[:, 5:], 0.5),
-            torch.where(actions[:, 5:] < -0.02, torch.full_like(actions[:, 5:], -0.5), torch.zeros_like(actions[:, 5:])),
+            actions[:, len(BINARY_ACTION_NAMES):] > 0.02,
+            torch.full_like(actions[:, len(BINARY_ACTION_NAMES):], 0.5),
+            torch.where(actions[:, len(BINARY_ACTION_NAMES):] < -0.02, torch.full_like(actions[:, len(BINARY_ACTION_NAMES):], -0.5), torch.zeros_like(actions[:, len(BINARY_ACTION_NAMES):])),
         ),
     ], dim=1)
     different = torch.any(prototypes[None, :, :] != current[:, None, :], dim=2)
@@ -828,7 +838,7 @@ def _inspect_action_dataset(dataset_dir, frame_gap=1, action_aggregation="window
         active = False
         for name in ACTION_NAMES:
             value = float(row.get(name, 0.0))
-            if abs(value) > (0.5 if name in ACTION_NAMES[:5] else 0.02):
+            if abs(value) > (0.5 if name in BINARY_ACTION_NAMES else 0.02):
                 report["action_counts"][name] += 1
                 active = True
         if not active:
@@ -1038,14 +1048,14 @@ def select_training_chunk(pairs, chunk_size=0, chunk_offset=0, mode="balanced", 
 
     # Weighted sampling without replacement. Rare controls receive a moderate
     # inverse-square-root boost, while W is still allowed to remain naturally common.
-    counts = [sum(float(pair[2][i]) > 0.5 for pair in pairs) for i in range(5)]
+    counts = [sum(float(pair[2][i]) > 0.5 for pair in pairs) for i in range(len(BINARY_ACTION_NAMES))]
     reference = max(1, max(counts))
     ranked = []
     for index, pair in enumerate(pairs):
-        active = [i for i, value in enumerate(pair[2][:5]) if float(value) > 0.5]
+        active = [i for i, value in enumerate(pair[2][:len(BINARY_ACTION_NAMES)]) if float(value) > 0.5]
         if active:
             weight = max(math.sqrt(reference / max(1, counts[i])) for i in active)
-        elif any(abs(float(value)) > 0.02 for value in pair[2][5:]):
+        elif any(abs(float(value)) > 0.02 for value in pair[2][len(BINARY_ACTION_NAMES):]):
             weight = 1.5
         else:
             weight = 1.0
@@ -1125,7 +1135,7 @@ def save_action_model(model, output_dir, args, epoch, stopped=False):
     model.save_pretrained(output_dir / "unet", safe_serialization=True)
     info = {
         "model_type": "action_conditioned_rectified_flow_video",
-        "format_version": 3,
+        "format_version": 4,
         "name": args.model_name,
         "resolution": f"{model_frame_size(model)[1]}x{model_frame_size(model)[0]}",
         "width": model_frame_size(model)[1],
@@ -1321,7 +1331,7 @@ def evaluate_action_model(model, val_loader, device, amp_enabled, args):
                 counts["counterfactual"] += int(clean.shape[0])
             idle_mask = (
                 torch.all(actions[:, :5] < 0.5, dim=1)
-                & torch.all(torch.abs(actions[:, 5:]) <= 0.02, dim=1)
+                & torch.all(torch.abs(actions[:, len(BINARY_ACTION_NAMES):]) <= 0.02, dim=1)
             )
             action_mask = ~idle_mask
             totals["flow"] += float(per_sample.sum().item())
@@ -1507,7 +1517,7 @@ def training_worker(args):
             # turning a handful of rare clips into almost every batch.
             selected_actions = [pairs[index][2] for index in train_dataset.indices]
             counts = [
-                sum(abs(float(action[i])) > (0.5 if i < 5 else 0.02) for action in selected_actions)
+            sum(abs(float(action[i])) > (0.5 if i < len(BINARY_ACTION_NAMES) else 0.02) for action in selected_actions)
                 for i in range(ACTION_DIM)
             ]
             reference = max(1, max(counts))
@@ -1515,7 +1525,7 @@ def training_worker(args):
             for action in selected_actions:
                 active = [
                     i for i, value in enumerate(action)
-                    if abs(float(value)) > (0.5 if i < 5 else 0.02)
+                if abs(float(value)) > (0.5 if i < len(BINARY_ACTION_NAMES) else 0.02)
                 ]
                 if active:
                     weight = max(min(8.0, math.sqrt(reference / max(1, counts[i]))) for i in active)
@@ -2716,7 +2726,7 @@ class TrainTab(ttk.Frame):
             idle_pct = 100.0 * report["idle_rows"] / usable
             binary_rates = {
                 name: 100.0 * report["action_counts"][name] / usable
-                for name in ACTION_NAMES[:5]
+                for name in BINARY_ACTION_NAMES
             }
             for name, rate in binary_rates.items():
                 if rate == 0.0:
@@ -3130,6 +3140,8 @@ class PlayerTab(ttk.Frame):
         self.motion_noise_refresh = DEFAULT_MOTION_NOISE_REFRESH
         self.active_noise_multiplier = DEFAULT_ACTIVE_NOISE_MULTIPLIER
         self.frame_stability_var = tk.DoubleVar(value=25.0)
+        self.animate_idle_var = tk.BooleanVar(value=True)
+        self.idle_noise_var = tk.DoubleVar(value=0.18)
         self.frame_stability_text = tk.StringVar(value="Motion-aware stability: 25%")
         self.motion_profile_summary = "Balanced movement profile"
         self.compare_photo = None
@@ -3214,6 +3226,11 @@ class PlayerTab(ttk.Frame):
             wraplength=250,
             justify="left",
         ).pack(fill="x", pady=(0, 4))
+        ttk.Checkbutton(
+            controls, text="Keep no-input scenes animated", variable=self.animate_idle_var,
+        ).pack(anchor="w", pady=(4, 1))
+        self.idle_noise = Field(controls, "Idle animation amount", "0.18", ["0.05", "0.10", "0.18", "0.25", "0.35"])
+        self.idle_noise.pack(fill="x", pady=(1, 5))
         self.require_right_mouse_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(
             controls,
@@ -3233,7 +3250,8 @@ class PlayerTab(ttk.Frame):
         ttk.Label(
             controls,
             text=(
-                "Use W/A/S/D or the arrow keys, plus Space. Idle holds the current frame; an active control shows the "
+                "Use WASD, distinct arrow keys, Space, common special keys, and mouse buttons. No-input scenes can keep "
+                "animating for rhythm-game opponents, effects, and ambient motion; an active control shows the "
                 "model's raw, action-guided next frame. Right-drag controls degree-calibrated yaw/pitch; the wheel "
                 "controls zoom. A reference video can calibrate movement frequency, but not teach missing controls. "
                 "Motion-aware stability aligns the preceding view and rejects changed or newly exposed regions. "
@@ -3393,7 +3411,7 @@ class PlayerTab(ttk.Frame):
             print(f"Real motion subdivision: {self.motion_subdivision.get()}", flush=True)
             print(f"Display frame multiplier: {self.display_multiplier.get()}", flush=True)
             print(f"Flow steps / denoise method: {int(self.steps.get())} / {self.method.get()}", flush=True)
-            print("Idle is frozen; generated frames are displayed raw.\n", flush=True)
+            print("No-input animation follows the player setting; generated frames are displayed raw.\n", flush=True)
             self._last_settings_signature = signature
 
         return issues, frame_gap, trained_scale
@@ -3498,8 +3516,18 @@ class PlayerTab(ttk.Frame):
                 self.pending_zoom += float(dy)
 
         def on_click(_x, _y, button, pressed):
-            if button == mouse.Button.right:
-                with self.control_lock:
+            names = {
+                mouse.Button.left: "mouse_left", mouse.Button.middle: "mouse_middle",
+                mouse.Button.right: "mouse_right",
+            }
+            with self.control_lock:
+                name = names.get(button)
+                if name:
+                    if pressed:
+                        self.keys.add(name)
+                    else:
+                        self.keys.discard(name)
+                if button == mouse.Button.right:
                     self.right_mouse_held = bool(pressed)
 
         self.mouse_listener = mouse.Listener(on_move=on_move, on_scroll=on_scroll, on_click=on_click)
@@ -3518,16 +3546,27 @@ class PlayerTab(ttk.Frame):
                 char = key.char.lower()
             except Exception:
                 char = None
-            if char in {"w", "a", "s", "d"}:
+            if char in {"w", "a", "s", "d", "q", "e", "r", "f", "z", "x", "c", "v"}:
                 return char
             arrow_actions = {
-                keyboard.Key.up: "w", keyboard.Key.left: "a",
-                keyboard.Key.down: "s", keyboard.Key.right: "d",
+                keyboard.Key.up: "arrow_up", keyboard.Key.left: "arrow_left",
+                keyboard.Key.down: "arrow_down", keyboard.Key.right: "arrow_right",
             }
             if key in arrow_actions:
                 return arrow_actions[key]
             if key == keyboard.Key.space:
                 return "space"
+            special = {
+                keyboard.Key.enter: "enter", keyboard.Key.shift: "shift",
+                keyboard.Key.shift_l: "shift", keyboard.Key.shift_r: "shift",
+                keyboard.Key.ctrl: "ctrl", keyboard.Key.ctrl_l: "ctrl", keyboard.Key.ctrl_r: "ctrl",
+                keyboard.Key.alt: "alt", keyboard.Key.alt_l: "alt", keyboard.Key.alt_r: "alt",
+                keyboard.Key.tab: "tab", keyboard.Key.esc: "escape",
+            }
+            if key in special:
+                return special[key]
+            if char in {"1", "2", "3", "4"}:
+                return "key_" + char
             return None
 
         def on_press(key):
@@ -3574,6 +3613,8 @@ class PlayerTab(ttk.Frame):
             "max_yaw_degrees_per_frame": float(info.get("max_yaw_degrees_per_frame", 45.0)),
             "max_pitch_degrees_per_frame": float(info.get("max_pitch_degrees_per_frame", 30.0)),
             "require_right_mouse": bool(self.require_right_mouse_var.get()),
+            "animate_idle": bool(self.animate_idle_var.get()),
+            "idle_noise_multiplier": max(0.0, min(1.0, float(self.idle_noise.get()))),
         }
 
     def publish_runtime_settings(self):
@@ -3601,23 +3642,16 @@ class PlayerTab(ttk.Frame):
                 self.pending_mouse_dy = 0.0
                 self.pending_zoom = 0.0
             keys = set(self.keys)
-        values = [
-            1.0 if "w" in keys else 0.0,
-            1.0 if "a" in keys else 0.0,
-            1.0 if "s" in keys else 0.0,
-            1.0 if "d" in keys else 0.0,
-            1.0 if "space" in keys else 0.0,
-            mouse_dx,
-            mouse_dy,
-            zoom,
-        ]
+        key_aliases = {"jump": "space"}
+        values = [1.0 if key_aliases.get(name, name) in keys else 0.0 for name in BINARY_ACTION_NAMES]
+        values += [mouse_dx, mouse_dy, zoom]
         enabled = self.enabled_actions_for_model(settings.get("model_key"))
         values = [value if ACTION_NAMES[index] in enabled else 0.0
                   for index, value in enumerate(values)]
         # Ignore tiny mouse jitter so idle genuinely holds the current frame.
-        moving = any(v > 0.5 for v in values[:5]) or abs(mouse_dx) > 0.02 or abs(mouse_dy) > 0.02 or abs(zoom) > 0.02
+        moving = any(v > 0.5 for v in values[:len(BINARY_ACTION_NAMES)]) or abs(mouse_dx) > 0.02 or abs(mouse_dy) > 0.02 or abs(zoom) > 0.02
         if not moving:
-            values[5:] = [0.0, 0.0, 0.0]
+            values[len(BINARY_ACTION_NAMES):] = [0.0, 0.0, 0.0]
         return values, moving
 
     def blend_noise(self, previous_shape, refresh, generator):
@@ -3654,7 +3688,7 @@ class PlayerTab(ttk.Frame):
     def update_input(self):
         with self.control_lock:
             keys = set(self.keys)
-        labels = [name.upper() if name != "space" else "SPACE" for name in ["w", "a", "s", "d", "space"] if name in keys]
+        labels = [ACTION_DISPLAY_NAMES.get(name, name.upper()) for name in BINARY_ACTION_NAMES if ({"jump": "space"}.get(name, name) in keys)]
         self.input_var.set("Input: " + (" + ".join(labels) if labels else "IDLE"))
 
     def toggle(self):
@@ -3721,14 +3755,15 @@ class PlayerTab(ttk.Frame):
                 previous = source.pil_to_normalized_tensor(self.current_frame, self.device, self.dtype)
                 action_values, moving = self.action_snapshot(settings, reset_mouse=True)
                 input_text = (
-                    "Guided input: " + (" + ".join([name.upper() for name, value in zip(ACTION_NAMES[:5], action_values[:5]) if value > 0.5]) or "IDLE")
-                    + f"  |  yaw {action_values[5]:+.2f}  pitch {action_values[6]:+.2f}  zoom {action_values[7]:+.2f}"
+                    "Guided input: " + (" + ".join([ACTION_DISPLAY_NAMES.get(name, name.upper()) for name, value in zip(BINARY_ACTION_NAMES, action_values[:len(BINARY_ACTION_NAMES)]) if value > 0.5]) or "IDLE")
+                    + f"  |  yaw {action_values[-3]:+.2f}  pitch {action_values[-2]:+.2f}  zoom {action_values[-1]:+.2f}"
                     + f"  |  guidance {settings['guidance']:.1f}x"
                     + f"  |  real motion 1/{settings['motion_subdivision']}"
                     + f"  |  motion {settings['motion_noise_refresh'] * settings['active_noise_multiplier']:.3f}"
                 )
 
-                if not moving:
+                animate_idle = bool(settings.get("animate_idle", True))
+                if not moving and not animate_idle:
                     model_result = self.current_frame.copy()
                     time.sleep(0.02)
                 else:
@@ -3737,7 +3772,7 @@ class PlayerTab(ttk.Frame):
                     subdivisions = settings["motion_subdivision"]
                     active_refresh = (
                         settings["motion_noise_refresh"] *
-                        settings["active_noise_multiplier"] /
+                        (settings["active_noise_multiplier"] if moving else settings.get("idle_noise_multiplier", 0.18)) /
                         subdivisions
                     )
                     initial_noise = self.blend_noise(previous.shape, active_refresh, generator)
@@ -3848,11 +3883,11 @@ class PlayerTab(ttk.Frame):
                     values[index] = value
                     compare_actions.append((label, values))
             for profile in info.get("observed_binary_actions", []):
-                active = [BINARY_ACTION_NAMES[i] for i, value in enumerate(profile[:5]) if float(value) > 0.5]
+                active = [BINARY_ACTION_NAMES[i] for i, value in enumerate(profile[:len(BINARY_ACTION_NAMES)]) if float(value) > 0.5]
                 if len(active) < 2 or any(name not in enabled for name in active):
                     continue
                 values = [0.0] * ACTION_DIM
-                values[:5] = [float(value) for value in profile[:5]]
+                values[:len(BINARY_ACTION_NAMES)] = [float(value) for value in profile[:len(BINARY_ACTION_NAMES)]]
                 label = "+".join(ACTION_DISPLAY_NAMES.get(name, name.upper()) for name in active)
                 if label not in {existing_label for existing_label, _values in compare_actions}:
                     compare_actions.append((label, values))

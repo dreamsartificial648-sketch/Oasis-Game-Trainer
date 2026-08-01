@@ -43,6 +43,13 @@ MAX_YAW_DEGREES_PER_FRAME = 45.0
 MAX_PITCH_DEGREES_PER_FRAME = 30.0
 APP_DIR = Path(__file__).resolve().parent
 CAPTURE_PRESETS_FILE = APP_DIR / "roblox_action_capture_regions.json"
+EXTRA_BINARY_ACTIONS = (
+    "arrow_up", "arrow_left", "arrow_down", "arrow_right",
+    "enter", "shift", "ctrl", "alt", "tab", "escape",
+    "q", "e", "r", "f", "z", "x", "c", "v",
+    "key_1", "key_2", "key_3", "key_4",
+    "mouse_left", "mouse_middle", "mouse_right",
+)
 
 
 class WindowsRawMouseInput:
@@ -193,6 +200,11 @@ class ActionState:
     camera_active: int = 0
     camera_yaw_delta_degrees: float = 0.0
     camera_pitch_delta_degrees: float = 0.0
+    extra_inputs: dict[str, int] | None = None
+
+    def __post_init__(self):
+        if self.extra_inputs is None:
+            self.extra_inputs = {name: 0 for name in EXTRA_BINARY_ACTIONS}
 
     def set_direction(self, direction: str, pressed: int) -> None:
         """Set a canonical direction shared by WASD and arrow-key controls."""
@@ -222,6 +234,7 @@ class ActionState:
             labels.append("CAM")
         if abs(self.zoom) > 0.02:
             labels.append("ZOOM")
+        labels.extend(name.upper() for name, value in self.extra_inputs.items() if value)
         return "-".join(labels) if labels else "IDLE"
 
 
@@ -388,7 +401,7 @@ class RobloxActionRecorder:
 
         ttk.Label(
             outer,
-            text="Records aligned W/A/S/D or arrow-key directions, Space, mouse movement, and zoom labels.",
+            text="Records distinct keyboard keys, mouse buttons, camera movement, and wheel input for many game styles.",
             style="Body.TLabel"
         ).pack(anchor="w", pady=(2, 12))
 
@@ -718,15 +731,15 @@ class RobloxActionRecorder:
                 except Exception:
                     char = None
 
-                direction = {
-                    "w": "w", "a": "a", "s": "s", "d": "d",
-                    keyboard.Key.up: "w", keyboard.Key.left: "a",
-                    keyboard.Key.down: "s", keyboard.Key.right: "d",
-                }.get(char if char is not None else key)
+                direction = {"w": "w", "a": "a", "s": "s", "d": "d"}.get(char)
                 if direction:
                     self.action_state.set_direction(direction, 1)
                 elif key == keyboard.Key.space:
                     self.action_state.jump = 1
+                else:
+                    name = self._extra_key_name(key, char)
+                    if name:
+                        self.action_state.extra_inputs[name] = 1
 
                 self._queue_action_label()
 
@@ -737,21 +750,42 @@ class RobloxActionRecorder:
                 except Exception:
                     char = None
 
-                direction = {
-                    "w": "w", "a": "a", "s": "s", "d": "d",
-                    keyboard.Key.up: "w", keyboard.Key.left: "a",
-                    keyboard.Key.down: "s", keyboard.Key.right: "d",
-                }.get(char if char is not None else key)
+                direction = {"w": "w", "a": "a", "s": "s", "d": "d"}.get(char)
                 if direction:
                     self.action_state.set_direction(direction, 0)
                 elif key == keyboard.Key.space:
                     self.action_state.jump = 0
+                else:
+                    name = self._extra_key_name(key, char)
+                    if name:
+                        self.action_state.extra_inputs[name] = 0
 
                 self._queue_action_label()
 
         self.keyboard_listener = keyboard.Listener(on_press=on_press, on_release=on_release)
         self.keyboard_listener.daemon = True
         self.keyboard_listener.start()
+
+    @staticmethod
+    def _extra_key_name(key, char=None):
+        if keyboard is None:
+            return None
+        special = {
+            keyboard.Key.up: "arrow_up", keyboard.Key.left: "arrow_left",
+            keyboard.Key.down: "arrow_down", keyboard.Key.right: "arrow_right",
+            keyboard.Key.enter: "enter", keyboard.Key.shift: "shift",
+            keyboard.Key.shift_l: "shift", keyboard.Key.shift_r: "shift",
+            keyboard.Key.ctrl: "ctrl", keyboard.Key.ctrl_l: "ctrl", keyboard.Key.ctrl_r: "ctrl",
+            keyboard.Key.alt: "alt", keyboard.Key.alt_l: "alt", keyboard.Key.alt_r: "alt",
+            keyboard.Key.tab: "tab", keyboard.Key.esc: "escape",
+        }
+        if key in special:
+            return special[key]
+        if char in {"q", "e", "r", "f", "z", "x", "c", "v"}:
+            return char
+        if char in {"1", "2", "3", "4"}:
+            return "key_" + char
+        return None
 
     def _handle_f8(self):
         if self.automation_running:
@@ -791,10 +825,17 @@ class RobloxActionRecorder:
                 self.pending_zoom += float(dy)
 
         def on_click(_x, _y, button, pressed):
-            if button == mouse.Button.right:
-                with self.action_lock:
+            button_names = {
+                mouse.Button.left: "mouse_left", mouse.Button.middle: "mouse_middle",
+                mouse.Button.right: "mouse_right",
+            }
+            with self.action_lock:
+                name = button_names.get(button)
+                if name:
+                    self.action_state.extra_inputs[name] = 1 if pressed else 0
+                if button == mouse.Button.right:
                     self.action_state.right_mouse = 1 if pressed else 0
-                self._queue_action_label()
+            self._queue_action_label()
 
         self.mouse_listener = mouse.Listener(on_move=on_move, on_scroll=on_scroll, on_click=on_click)
         self.mouse_listener.daemon = True
@@ -1295,7 +1336,7 @@ class RobloxActionRecorder:
                 return
 
         config_data = {
-            "format_version": 3,
+            "format_version": 4,
             "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
             "capture_fps": fps,
             "output_resolution": f"{width}x{height}",
@@ -1304,7 +1345,7 @@ class RobloxActionRecorder:
             "aspect_ratio": "16:9",
             "resize_method": self.crop_mode_var.get(),
             "action_dimensions": [
-                "w", "a", "s", "d", "jump", "mouse_dx", "mouse_dy", "zoom", "move_x", "move_y",
+                "w", "a", "s", "d", "jump", *EXTRA_BINARY_ACTIONS, "mouse_dx", "mouse_dy", "zoom", "move_x", "move_y",
                 "right_mouse", "camera_active", "camera_yaw_delta_degrees", "camera_pitch_delta_degrees",
             ],
             "mouse_normalization_pixels": float(self.mouse_scale_var.get()),
@@ -1509,6 +1550,7 @@ class RobloxActionRecorder:
                         "move_x": action.move_x,
                         "move_y": action.move_y,
                     }
+                    record.update(action.extra_inputs)
                     metadata_file.write(json.dumps(record) + "\n")
                     metadata_file.flush()
 
