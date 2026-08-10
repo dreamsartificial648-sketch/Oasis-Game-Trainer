@@ -2,6 +2,8 @@ mss
 Pillow
 pynput
 opencv-python
+numpy<2
+protobuf<5
 torch
 torchvision
 diffusers
