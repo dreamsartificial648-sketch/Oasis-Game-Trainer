@@ -27,6 +27,13 @@ ACTION_MODELS_DIR = APP_DIR / "output_action_flow_models"
 ACTION_GENERATIONS_DIR = APP_DIR / "action_flow_captures"
 STOP_FILE_NAME = "stop_action_training.flag"
 TRAINING_SETTINGS_FILE = APP_DIR / "roblox_action_flow_training_settings.json"
+HUGGING_FACE_MODEL_CATALOG = [
+    {
+        "name": "Super Mario 64 Oasis Model",
+        "repo_id": "SyntheticMDProductions/Super_Mario_64_Oasis_Model",
+        "revision": "main",
+    },
+]
 
 BG = "#15171d"
 PANEL = "#20232b"
@@ -442,13 +449,72 @@ def action_model_is_valid(path):
     path = Path(path)
     try:
         info = json.loads((path / "action_flow_model_info.json").read_text(encoding="utf-8"))
-        return info.get("model_type") == "action_conditioned_rectified_flow_video" and (path / "unet" / "config.json").is_file()
+        weight_files = (
+            path / "unet" / "diffusion_pytorch_model.safetensors",
+            path / "unet" / "diffusion_pytorch_model.bin",
+        )
+        return (
+            info.get("model_type") == "action_conditioned_rectified_flow_video"
+            and (path / "unet" / "config.json").is_file()
+            and any(candidate.is_file() for candidate in weight_files)
+        )
     except Exception:
         return False
 
 
+def download_hugging_face_action_model(repo_id, display_name, revision="main"):
+    """Download and validate a public Hub model before placing it in the library."""
+    try:
+        from huggingface_hub import snapshot_download
+    except ImportError as exc:
+        raise RuntimeError(
+            "Hugging Face downloads need the huggingface-hub package. "
+            "Install the latest app requirements and try again."
+        ) from exc
+
+    ACTION_MODELS_DIR.mkdir(parents=True, exist_ok=True)
+    safe_name = "".join(
+        char if char.isalnum() or char in " -_." else "_" for char in display_name
+    ).strip(" .") or "Hugging Face Action Model"
+    destination = ACTION_MODELS_DIR / safe_name
+    if action_model_is_valid(destination):
+        return destination, False
+
+    temporary = ACTION_MODELS_DIR / f".downloading_{uuid.uuid4().hex}"
+    try:
+        snapshot_download(
+            repo_id=repo_id,
+            repo_type="model",
+            revision=revision,
+            local_dir=str(temporary),
+        )
+        candidates = [temporary] + [path for path in temporary.rglob("*") if path.is_dir()]
+        model_source = next((path for path in candidates if action_model_is_valid(path)), None)
+        if model_source is None:
+            raise ValueError(
+                f"{repo_id} does not yet contain a complete compatible Action Flow model. "
+                "Upload action_flow_model_info.json, unet/config.json, and the U-Net "
+                "safetensors or .bin weights, then try again."
+            )
+
+        if destination.exists():
+            raise ValueError(
+                f"The model folder {destination.name!r} already exists but is incomplete. "
+                "Move or remove that folder, then retry the download."
+            )
+        if model_source == temporary:
+            temporary.replace(destination)
+            temporary = None
+        else:
+            shutil.copytree(model_source, destination)
+        return destination, True
+    finally:
+        if temporary is not None:
+            shutil.rmtree(temporary, ignore_errors=True)
+
+
 def import_action_model_package(source_path):
-    """Register a viewer-supplied action model folder or a Kaggle ZIP package.
+    """Register a viewer-supplied action model folder or ZIP package.
 
     A folder is copied into the app's model library so the player keeps working
     even if the original download location changes.  ZIP files may contain the
@@ -3120,6 +3186,7 @@ class PlayerTab(ttk.Frame):
         self.running = False
         self.run_id = 0
         self.worker = None
+        self.download_worker = None
         self.frame_queue = queue.Queue(maxsize=2)
         self.ui_queue = queue.Queue(maxsize=16)
         self.display_sequence_token = 0
@@ -3179,11 +3246,28 @@ class PlayerTab(ttk.Frame):
         self.model_box = ttk.Combobox(controls, textvariable=self.model_var, state="readonly", width=31)
         self.model_box.pack(fill="x", pady=3)
         self.model_box.bind("<<ComboboxSelected>>", self.on_model_selected)
-        ttk.Button(controls, text="Add Downloaded Action Model (.zip or folder)", command=self.add_model_package).pack(fill="x", pady=3)
+        ttk.Label(controls, text="Download a playable model", style="Meta.TLabel").pack(anchor="w", pady=(7, 0))
+        self.hub_model_var = tk.StringVar(value=HUGGING_FACE_MODEL_CATALOG[0]["name"])
+        self.hub_model_box = ttk.Combobox(
+            controls,
+            textvariable=self.hub_model_var,
+            state="readonly",
+            values=[entry["name"] for entry in HUGGING_FACE_MODEL_CATALOG],
+            width=31,
+        )
+        self.hub_model_box.pack(fill="x", pady=3)
+        self.download_btn = ttk.Button(
+            controls,
+            text="Download & Install Model",
+            command=self.download_catalog_model,
+            style="Accent.TButton",
+        )
+        self.download_btn.pack(fill="x", pady=3)
+        ttk.Button(controls, text="Add Model from ZIP or Folder", command=self.add_model_package).pack(fill="x", pady=3)
         ttk.Button(controls, text="Refresh Models", command=self.refresh_models).pack(fill="x", pady=3)
         ttk.Label(
             controls,
-            text="1. Add the action model you downloaded.  2. Choose a screenshot from that game.  3. Start playing.",
+            text="1. Download a model here.  2. Choose a screenshot from that game.  3. Start playing.",
             style="Meta.TLabel", wraplength=250, justify="left",
         ).pack(fill="x", pady=(4, 5))
 
@@ -3311,6 +3395,62 @@ class PlayerTab(ttk.Frame):
             self.status.config(text=f"Action model ready: {imported.name}. Now choose a starting image.")
         except Exception as exc:
             messagebox.showerror("Could not add action model", str(exc))
+
+    def download_catalog_model(self):
+        """Download the selected public Hugging Face model without freezing the UI."""
+        if self.download_worker is not None and self.download_worker.is_alive():
+            return
+        selected_name = self.hub_model_var.get()
+        entry = next(
+            (item for item in HUGGING_FACE_MODEL_CATALOG if item["name"] == selected_name),
+            None,
+        )
+        if entry is None:
+            messagebox.showerror("No model selected", "Choose a model to download.")
+            return
+
+        existing = ACTION_MODELS_DIR / entry["name"]
+        if action_model_is_valid(existing):
+            self.refresh_models()
+            self.model_var.set(existing.name)
+            self.on_model_selected()
+            self.status.config(text=f"Action model ready: {existing.name}. Now choose a starting image.")
+            return
+
+        self.download_btn.config(state="disabled", text="Downloading Model...")
+        self.status.config(
+            text="Downloading from Hugging Face. Large model files may take several minutes..."
+        )
+        self.download_worker = threading.Thread(
+            target=self._download_catalog_model_worker,
+            args=(dict(entry),),
+            daemon=True,
+        )
+        self.download_worker.start()
+
+    def _download_catalog_model_worker(self, entry):
+        try:
+            destination, downloaded = download_hugging_face_action_model(
+                entry["repo_id"], entry["name"], entry.get("revision", "main")
+            )
+            self.after(0, self._download_catalog_model_complete, destination, downloaded)
+        except Exception as exc:
+            self.after(0, self._download_catalog_model_failed, str(exc))
+
+    def _download_catalog_model_complete(self, destination, downloaded):
+        self.download_worker = None
+        self.download_btn.config(state="normal", text="Download & Install Model")
+        self.refresh_models()
+        self.model_var.set(destination.name)
+        self.on_model_selected()
+        verb = "Downloaded" if downloaded else "Found"
+        self.status.config(text=f"{verb} {destination.name}. Now choose a starting image.")
+
+    def _download_catalog_model_failed(self, error):
+        self.download_worker = None
+        self.download_btn.config(state="normal", text="Download & Install Model")
+        self.status.config(text="Model download did not complete.")
+        messagebox.showerror("Could not download model", error)
 
     def update_frame_stability_label(self, value=None):
         amount = self.frame_stability_var.get() if value is None else float(value)

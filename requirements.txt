@@ -7,3 +7,4 @@ protobuf<5
 torch
 torchvision
 diffusers
+huggingface-hub>=0.36

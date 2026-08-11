@@ -11,10 +11,16 @@ This app lets you explore a generated, action-conditioned game world from one st
    ```
 
 2. Double-click `RUN_GAME_OASIS_PLAYER.bat`.
-3. Open the **Action Player** tab.
-4. Click **Add Downloaded Action Model (.zip or folder)** and choose the Kaggle ZIP download, or the extracted model folder.
+3. Open the **Game Oasis Player** tab.
+4. Choose **Super Mario 64 Oasis Model** and click **Download & Install Model**. The app downloads and validates it directly from Hugging Face.
 5. Click **Choose Starting Image** and choose a clear in-game screenshot from the same game.
 6. Click **Start Action Player**. Use the controls that were present in the model's recordings.
+
+The model is hosted at:
+
+<https://huggingface.co/SyntheticMDProductions/Super_Mario_64_Oasis_Model>
+
+You can still use **Add Model from ZIP or Folder** for manually downloaded models.
 
 Format-v4 recordings keep arrow keys separate from WASD and also capture left,
 middle, and right click; Enter; Shift/Ctrl/Alt; Tab/Escape; Q/E/R/F/Z/X/C/V;
@@ -28,7 +34,7 @@ turn off **Keep no-input scenes animated** when a frozen idle view is preferable
 
 The first start takes longer because the model loads into memory. A CUDA-capable NVIDIA GPU is strongly recommended.
 
-## What goes in the Kaggle download
+## What goes in a Hugging Face model repository or ZIP download
 
 Zip the complete trained action-model folder. The app supports a ZIP containing either the model files directly or one release folder containing them. The model needs this layout:
 
