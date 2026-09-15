@@ -2959,7 +2959,12 @@ class TrainTab(ttk.Frame):
             if device_choice not in {"auto", "cpu", "cuda"}:
                 raise ValueError("Choose Auto, CPU, or GPU as the compute option.")
             if engine == "vae_cpu_lite" and (base_value or continue_value):
-                raise ValueError("VAE CPU Lite is a new model type. Clear both existing-model fields before starting it.")
+                # These paths commonly come back from autosaved Pixel Flow
+                # settings. A latent VAE run cannot use either one, but that
+                # should not make the user manually clear old paths every time.
+                self.append("VAE CPU Lite is starting fresh; saved Pixel Flow model fields are being ignored.")
+                base_value = ""
+                continue_value = ""
             if engine == "pixel_flow" and continue_value and not action_model_is_valid(continue_value):
                 raise ValueError("The selected continuation Action Model is invalid.")
             if engine == "pixel_flow" and (not continue_value) and base_value and not base_video_model_is_valid(base_value):
