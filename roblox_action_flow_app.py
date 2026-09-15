@@ -453,11 +453,15 @@ def action_model_is_valid(path):
             path / "unet" / "diffusion_pytorch_model.safetensors",
             path / "unet" / "diffusion_pytorch_model.bin",
         )
-        return (
-            info.get("model_type") == "action_conditioned_rectified_flow_video"
-            and (path / "unet" / "config.json").is_file()
-            and any(candidate.is_file() for candidate in weight_files)
-        )
+        model_type = info.get("model_type")
+        has_unet = (path / "unet" / "config.json").is_file() and any(candidate.is_file() for candidate in weight_files)
+        if model_type == "action_conditioned_rectified_flow_video":
+            return has_unet
+        # Latent checkpoints are deliberately a distinct format: a complete codec
+        # travels with the U-Net, so a player can never mistake one for RGB flow.
+        return (model_type == "action_conditioned_latent_vae_flow_video" and has_unet
+                and (path / "vae" / "config.json").is_file()
+                and (path / "vae" / "pytorch_model.bin").is_file())
     except Exception:
         return False
 
@@ -667,6 +671,18 @@ def load_action_unet(model_dir, device=None, dtype=None):
         model.register_to_config(in_channels=6 + ACTION_DIM)
     elif channels != 6 + ACTION_DIM:
         raise ValueError("The selected checkpoint is not a compatible action-conditioned video model.")
+    if device is not None:
+        model.to(device)
+    return model
+
+
+def load_latent_action_unet(model_dir, device=None, dtype=None):
+    """Load the U-Net belonging to a VAE CPU Lite checkpoint."""
+    from diffusers import UNet2DModel
+    kwargs = {"torch_dtype": dtype} if dtype is not None else {}
+    model = UNet2DModel.from_pretrained(str(model_dir), subfolder="unet", **kwargs)
+    if int(model.config.in_channels) != 8 + ACTION_DIM or int(model.config.out_channels) != 4:
+        raise ValueError("The selected VAE CPU Lite checkpoint has an incompatible latent U-Net.")
     if device is not None:
         model.to(device)
     return model
@@ -1482,7 +1498,10 @@ def training_worker(args):
     args.motion_loss_weight = max(0.0, float(args.motion_loss_weight))
     args.replay_older_percent = max(0.0, float(args.replay_older_percent))
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    requested_device = getattr(args, "device", "auto")
+    if requested_device == "cuda" and not torch.cuda.is_available():
+        raise ValueError("GPU was selected, but CUDA is not available. Choose Auto or CPU.")
+    device = torch.device("cuda" if requested_device == "cuda" or (requested_device == "auto" and torch.cuda.is_available()) else "cpu")
     if device.type == "cuda":
         torch.backends.cuda.matmul.allow_tf32 = bool(args.tf32)
         torch.backends.cudnn.allow_tf32 = bool(args.tf32)
@@ -1534,6 +1553,17 @@ def training_worker(args):
     args.max_pitch_degrees_per_frame = dataset_report.get("max_pitch_degrees_per_frame", 30.0)
     args.require_right_mouse_for_camera = dataset_report.get("require_right_mouse_for_camera", False)
     dataset = ActionPairDataset(pairs, args.resolution, args.condition_noise)
+
+    if getattr(args, "model_engine", "pixel_flow") == "vae_cpu_lite":
+        if args.continue_action_model or args.base_model:
+            raise ValueError("VAE CPU Lite starts a new latent model; do not select a Pixel Flow base or continuation model.")
+        from vae_cpu_lite import train_vae_cpu_lite
+        args.action_names = ACTION_NAMES
+        event(type="warning", message=(
+            "VAE CPU Lite trains a compact frame codec first, then trains the action flow in 4-channel latent space. "
+            "It is a new checkpoint format and cannot continue Pixel Flow models."
+        ))
+        return train_vae_cpu_lite(args, dataset, event, action_maps, ACTION_DIM)
 
     validation_count = max(1, int(len(dataset) * args.validation_split)) if len(dataset) >= 10 else 1
     validation_count = min(validation_count, len(dataset) - 1)
@@ -2225,6 +2255,8 @@ class TrainTab(ttk.Frame):
         self.dataset_var = tk.StringVar()
         self.base_model_var = tk.StringVar()
         self.continue_var = tk.StringVar()
+        self.engine_var = tk.StringVar(value="pixel_flow")
+        self.device_var = tk.StringVar(value="auto")
         self.name_var = tk.StringVar(value="Roblox Action Flow")
         self.output_var = tk.StringVar(value=str(ACTION_MODELS_DIR / "Roblox Action Flow"))
 
@@ -2240,6 +2272,19 @@ class TrainTab(ttk.Frame):
             line.pack(fill="x", pady=(3, 0))
             ttk.Entry(line, textvariable=variable, style="Field.TEntry").pack(side="left", fill="x", expand=True)
             ttk.Button(line, text="Browse...", command=command).pack(side="left", padx=(7, 0))
+
+        engine_line = ttk.Frame(card, style="Card.TFrame")
+        engine_line.pack(fill="x", pady=(8, 0))
+        ttk.Label(engine_line, text="Training engine", style="Meta.TLabel").pack(side="left")
+        ttk.Combobox(engine_line, textvariable=self.engine_var, state="readonly", width=34,
+                     values=["pixel_flow", "vae_cpu_lite"]).pack(side="left", padx=(8, 0))
+        ttk.Label(engine_line, text="Compute", style="Meta.TLabel").pack(side="left", padx=(16, 0))
+        ttk.Combobox(engine_line, textvariable=self.device_var, state="readonly", width=10,
+                     values=["auto", "cpu", "cuda"]).pack(side="left", padx=(8, 0))
+        ttk.Label(card, text=(
+            "pixel_flow is the existing RGB engine (best with a GPU). vae_cpu_lite trains a small VAE, then runs the "
+            "action flow at one-quarter resolution per side; it works on CPU or GPU but creates a separate model type."
+        ), style="Meta.TLabel", wraplength=900, justify="left").pack(anchor="w", pady=(4, 0))
 
         ttk.Label(
             card,
@@ -2398,6 +2443,8 @@ class TrainTab(ttk.Frame):
             "dataset_dir": self.dataset_var,
             "base_model": self.base_model_var,
             "continue_action_model": self.continue_var,
+            "model_engine": self.engine_var,
+            "device": self.device_var,
             "model_name": self.name_var,
             "output_dir": self.output_var,
             "epochs": self.epochs.var,
@@ -2905,9 +2952,17 @@ class TrainTab(ttk.Frame):
                     return
             base_value = self.base_model_var.get().strip()
             continue_value = self.continue_var.get().strip()
-            if continue_value and not action_model_is_valid(continue_value):
+            engine = self.engine_var.get().strip().lower()
+            device_choice = self.device_var.get().strip().lower()
+            if engine not in {"pixel_flow", "vae_cpu_lite"}:
+                raise ValueError("Choose either pixel_flow or vae_cpu_lite as the training engine.")
+            if device_choice not in {"auto", "cpu", "cuda"}:
+                raise ValueError("Choose Auto, CPU, or GPU as the compute option.")
+            if engine == "vae_cpu_lite" and (base_value or continue_value):
+                raise ValueError("VAE CPU Lite is a new model type. Clear both existing-model fields before starting it.")
+            if engine == "pixel_flow" and continue_value and not action_model_is_valid(continue_value):
                 raise ValueError("The selected continuation Action Model is invalid.")
-            if (not continue_value) and base_value and not base_video_model_is_valid(base_value):
+            if engine == "pixel_flow" and (not continue_value) and base_value and not base_video_model_is_valid(base_value):
                 raise ValueError("The selected optional Roblox Flow video model is invalid. Clear the field to train from scratch.")
 
             values = {
@@ -2953,6 +3008,8 @@ class TrainTab(ttk.Frame):
                 "--base-model", base_value,
                 "--output-dir", str(output),
                 "--model-name", self.name_var.get().strip() or output.name,
+                "--model-engine", engine,
+                "--device", device_choice,
                 "--epochs", str(values["epochs"]),
                 "--resolution", str(values["resolution"]),
                 "--batch-size", str(values["batch"]),
@@ -3178,6 +3235,7 @@ class PlayerTab(ttk.Frame):
         self.loaded_key = None
         self.loaded_stamp = None
         self.loaded_model = None
+        self.loaded_vae = None
         self.device = None
         self.dtype = None
         self.current_frame = None
@@ -3463,6 +3521,7 @@ class PlayerTab(ttk.Frame):
             path / "unet" / "diffusion_pytorch_model.safetensors",
             path / "unet" / "diffusion_pytorch_model.bin",
             path / "action_flow_model_info.json",
+            path / "vae" / "pytorch_model.bin",
         ]
         values = []
         for candidate in candidates:
@@ -3473,6 +3532,7 @@ class PlayerTab(ttk.Frame):
 
     def unload_loaded_model(self):
         self.loaded_model = None
+        self.loaded_vae = None
         self.loaded_key = None
         self.loaded_stamp = None
         self.noise_state = None
@@ -3872,6 +3932,8 @@ class PlayerTab(ttk.Frame):
             source, _ = load_source_module()
             initial_settings = dict(self.runtime_settings)
             key = initial_settings["model_key"]
+            model_info = self.selected_model_info(key)
+            is_latent_vae = model_info.get("model_type") == "action_conditioned_latent_vae_flow_video"
             selected_stamp = self.model_stamp(key)
             self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
             self.dtype = torch.float16 if self.device.type == "cuda" else torch.float32
@@ -3880,7 +3942,13 @@ class PlayerTab(ttk.Frame):
                 self.loaded_model = None
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
-                self.loaded_model = load_action_unet(self.models[key], self.device, self.dtype)
+                if is_latent_vae:
+                    from vae_cpu_lite import load_vae
+                    self.loaded_vae = load_vae(self.models[key], self.device, self.dtype)
+                    self.loaded_model = load_latent_action_unet(self.models[key], self.device, self.dtype)
+                else:
+                    self.loaded_vae = None
+                    self.loaded_model = load_action_unet(self.models[key], self.device, self.dtype)
                 self.loaded_key = key
                 self.loaded_stamp = selected_stamp
                 self.noise_state = None
@@ -3892,7 +3960,12 @@ class PlayerTab(ttk.Frame):
                 started = time.perf_counter()
                 settings = dict(self.runtime_settings)
                 previous_frame = self.current_frame
-                previous = source.pil_to_normalized_tensor(self.current_frame, self.device, self.dtype)
+                previous_rgb = source.pil_to_normalized_tensor(self.current_frame, self.device, self.dtype)
+                if is_latent_vae:
+                    with torch.inference_mode():
+                        previous = self.loaded_vae.encode(previous_rgb)
+                else:
+                    previous = previous_rgb
                 action_values, moving = self.action_snapshot(settings, reset_mouse=True)
                 input_text = (
                     "Guided input: " + (" + ".join([ACTION_DISPLAY_NAMES.get(name, name.upper()) for name, value in zip(BINARY_ACTION_NAMES, action_values[:len(BINARY_ACTION_NAMES)]) if value > 0.5]) or "IDLE")
@@ -3931,6 +4004,9 @@ class PlayerTab(ttk.Frame):
                         action_input_scale=settings["action_input_scale"],
                         guidance=settings["guidance"],
                     )
+                    if is_latent_vae:
+                        with torch.inference_mode():
+                            generated = self.loaded_vae.decode(generated)
                     model_result = source.tensor_to_pil(generated[0])
                     try:
                         model_result = motion_aware_stabilize(
@@ -4207,6 +4283,8 @@ def parse_args():
     parser.add_argument("--dataset-dir")
     parser.add_argument("--base-model", default="")
     parser.add_argument("--continue-action-model", default="")
+    parser.add_argument("--model-engine", choices=["pixel_flow", "vae_cpu_lite"], default="pixel_flow")
+    parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
     parser.add_argument("--output-dir")
     parser.add_argument("--model-name", default="Roblox Action Flow")
     parser.add_argument("--epochs", type=int, default=30)
