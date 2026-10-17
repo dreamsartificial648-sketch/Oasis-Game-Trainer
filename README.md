@@ -2,7 +2,7 @@
 
 This app lets you explore a generated, action-conditioned game world from one starting screenshot. It is intended for a model trained for the same game and visual style as that screenshot.
 
-Extra info explaining it: file:///D:/Users/PlayRobloxAllDay/Desktop/Programs/Oasis-Game-Trainer/output/pdf/oasis-game-trainer-visual-guide.pdf
+[oasis-game-trainer-visual-guide.pdf](https://github.com/user-attachments/files/33606544/oasis-game-trainer-visual-guide.pdf)
 
 ## Quick start
 
